@@ -13,6 +13,13 @@ const status = document.querySelector('#status');
 
 const DEFAULT_ALLOW_VERTICAL_MOTION = true;
 const DEFAULT_ALLOW_FLOOR_MOTION = true;
+const BLINK_INTERVAL_RANGE_SECONDS = [2.4, 5.8];
+const DOUBLE_BLINK_INTERVAL_RANGE_SECONDS = [0.1, 0.28];
+const DOUBLE_BLINK_CHANCE = 0.18;
+const BLINK_CLOSE_DURATION_RANGE_SECONDS = [0.05, 0.085];
+const BLINK_HOLD_DURATION_RANGE_SECONDS = [0.025, 0.05];
+const BLINK_OPEN_DURATION_RANGE_SECONDS = [0.07, 0.12];
+const BLINK_EYE_SCALE_RANGE = [0.92, 1];
 
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -69,6 +76,152 @@ let currentAction = null;
 let currentAvatarRoot = null;
 let currentMotionRoot = null;
 let currentAnimationSource = null;
+let blinkState = createBlinkState();
+
+function randomBetween(min, max) {
+  return min + Math.random() * (max - min);
+}
+
+function createBlinkState() {
+  return {
+    elapsed: 0,
+    nextBlinkAt: randomBetween(...BLINK_INTERVAL_RANGE_SECONDS),
+    phase: 'idle',
+    phaseElapsed: 0,
+    closeDuration: randomBetween(...BLINK_CLOSE_DURATION_RANGE_SECONDS),
+    holdDuration: randomBetween(...BLINK_HOLD_DURATION_RANGE_SECONDS),
+    openDuration: randomBetween(...BLINK_OPEN_DURATION_RANGE_SECONDS),
+    leftScale: 1,
+    rightScale: 1,
+    queueDoubleBlink: false
+  };
+}
+
+function resetBlinkState() {
+  blinkState = createBlinkState();
+  applyBlinkWeight(0, 0);
+}
+
+function scheduleNextBlink(isDoubleBlink = false) {
+  const waitTime = isDoubleBlink
+    ? randomBetween(...DOUBLE_BLINK_INTERVAL_RANGE_SECONDS)
+    : randomBetween(...BLINK_INTERVAL_RANGE_SECONDS);
+  blinkState.nextBlinkAt = blinkState.elapsed + waitTime;
+}
+
+function beginBlinkCycle() {
+  blinkState.phase = 'closing';
+  blinkState.phaseElapsed = 0;
+  blinkState.closeDuration = randomBetween(...BLINK_CLOSE_DURATION_RANGE_SECONDS);
+  blinkState.holdDuration = randomBetween(...BLINK_HOLD_DURATION_RANGE_SECONDS);
+  blinkState.openDuration = randomBetween(...BLINK_OPEN_DURATION_RANGE_SECONDS);
+  blinkState.leftScale = randomBetween(...BLINK_EYE_SCALE_RANGE);
+  blinkState.rightScale = randomBetween(...BLINK_EYE_SCALE_RANGE);
+  blinkState.queueDoubleBlink = Math.random() < DOUBLE_BLINK_CHANCE;
+}
+
+function getBlinkCapabilities(vrm) {
+  const manager = vrm?.expressionManager;
+
+  if (!manager) {
+    return { hasCombinedBlink: false, hasLeftBlink: false, hasRightBlink: false };
+  }
+
+  return {
+    hasCombinedBlink: manager.getExpression('blink') != null,
+    hasLeftBlink: manager.getExpression('blinkLeft') != null,
+    hasRightBlink: manager.getExpression('blinkRight') != null
+  };
+}
+
+function applyBlinkWeight(leftWeight, rightWeight) {
+  const manager = currentVrm?.expressionManager;
+
+  if (!manager) {
+    return;
+  }
+
+  const { hasCombinedBlink, hasLeftBlink, hasRightBlink } = getBlinkCapabilities(currentVrm);
+
+  if (hasLeftBlink || hasRightBlink) {
+    if (hasCombinedBlink) {
+      manager.setValue('blink', 0);
+    }
+
+    if (hasLeftBlink) {
+      manager.setValue('blinkLeft', leftWeight);
+    }
+
+    if (hasRightBlink) {
+      manager.setValue('blinkRight', rightWeight);
+    }
+
+    return;
+  }
+
+  if (hasCombinedBlink) {
+    manager.setValue('blink', Math.max(leftWeight, rightWeight));
+  }
+}
+
+function updateBlink(delta) {
+  if (!currentVrm?.expressionManager) {
+    return;
+  }
+
+  const { hasCombinedBlink, hasLeftBlink, hasRightBlink } = getBlinkCapabilities(currentVrm);
+
+  if (!hasCombinedBlink && !hasLeftBlink && !hasRightBlink) {
+    return;
+  }
+
+  blinkState.elapsed += delta;
+
+  if (blinkState.phase === 'idle') {
+    if (blinkState.elapsed >= blinkState.nextBlinkAt) {
+      beginBlinkCycle();
+    } else {
+      applyBlinkWeight(0, 0);
+      return;
+    }
+  }
+
+  blinkState.phaseElapsed += delta;
+
+  let normalizedWeight = 0;
+
+  if (blinkState.phase === 'closing') {
+    normalizedWeight = Math.min(1, blinkState.phaseElapsed / blinkState.closeDuration);
+
+    if (blinkState.phaseElapsed >= blinkState.closeDuration) {
+      blinkState.phase = 'holding';
+      blinkState.phaseElapsed = 0;
+      normalizedWeight = 1;
+    }
+  } else if (blinkState.phase === 'holding') {
+    normalizedWeight = 1;
+
+    if (blinkState.phaseElapsed >= blinkState.holdDuration) {
+      blinkState.phase = 'opening';
+      blinkState.phaseElapsed = 0;
+    }
+  } else if (blinkState.phase === 'opening') {
+    normalizedWeight = 1 - Math.min(1, blinkState.phaseElapsed / blinkState.openDuration);
+
+    if (blinkState.phaseElapsed >= blinkState.openDuration) {
+      blinkState.phase = 'idle';
+      blinkState.phaseElapsed = 0;
+      normalizedWeight = 0;
+      scheduleNextBlink(blinkState.queueDoubleBlink);
+      blinkState.queueDoubleBlink = false;
+    }
+  }
+
+  applyBlinkWeight(
+    normalizedWeight * blinkState.leftScale,
+    normalizedWeight * blinkState.rightScale
+  );
+}
 
 function setStatus(message, isError = false) {
   status.textContent = message;
@@ -112,6 +265,8 @@ function disposeCurrentModel() {
   }
 
   currentMotionRoot = null;
+  applyBlinkWeight(0, 0);
+  resetBlinkState();
   VRMUtils.deepDispose(currentVrm.scene);
   currentVrm = null;
 
@@ -169,6 +324,7 @@ function resetModelPosition() {
 async function loadVrm(url, label = 'default VRM') {
   disposeCurrentModel();
   currentVrmUrl = url;
+  resetBlinkState();
   setStatus(`Loading ${label}...`);
 
   try {
@@ -251,6 +407,7 @@ function animate() {
 
   const delta = clock.getDelta();
   currentMixer?.update(delta);
+  updateBlink(delta);
   currentVrm?.update(delta);
 
   controls.update();
