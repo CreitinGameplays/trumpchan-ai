@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>VRM Viewer Starter</title>
+    <script type="module" src="/src/main.js"></script>
+  </head>
+  <body>
+    <div id="app">
+      <aside class="panel">
+        <p class="eyebrow">VRM Viewer</p>
+        <h1>Load a Vroid model locally</h1>
+        <p class="copy">
+          Pick a <code>.vrm</code> file from your computer and preview it directly in the browser.
+        </p>
+        <label class="picker">
+          <span>Choose .vrm file</span>
+          <input id="vrmInput" type="file" accept=".vrm,model/gltf-binary" />
+        </label>
+        <label class="picker picker-secondary">
+          <span>Choose Mixamo .fbx</span>
+          <input id="animationInput" type="file" accept=".fbx" />
+        </label>
+        <label class="toggle">
+          <input id="allowVerticalMotion" type="checkbox" />
+          <span>Allow vertical motion</span>
+        </label>
+        <label class="toggle">
+          <input id="allowFloorMotion" type="checkbox" />
+          <span>Allow floor movement</span>
+        </label>
+        <button id="openViewerButton" class="viewer-launch" type="button">Open viewer</button>
+        <button id="resetPositionButton" class="picker picker-tertiary" type="button">Reset model position</button>
+        <p class="hint">Use a Mixamo animation exported as `.fbx`, ideally `Without Skin`.</p>
+        <p id="status" class="status">Waiting for a model...</p>
+      </aside>
+      <div id="viewerModal" class="viewer-modal" aria-hidden="true">
+        <div class="viewer-modal__backdrop" data-close-viewer="true"></div>
+        <main class="viewport" role="dialog" aria-modal="true" aria-labelledby="viewerModalTitle">
+          <div class="viewport__toolbar">
+            <p id="viewerModalTitle" class="viewport__title">VRM Viewer</p>
+            <div class="viewport__actions">
+              <button
+                id="expandViewerButton"
+                class="viewer-icon-button"
+                type="button"
+                aria-label="Expand VRM viewer"
+                title="Expand viewer"
+              >
+                <span class="viewer-icon viewer-icon--expand" aria-hidden="true"></span>
+              </button>
+              <button id="closeViewerButton" class="viewer-close" type="button" aria-label="Close VRM viewer">
+                Close
+              </button>
+            </div>
+          </div>
+          <canvas id="scene"></canvas>
+        </main>
+      </div>
+    </div>
+  </body>
+</html>
