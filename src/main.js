@@ -20,6 +20,18 @@ const BLINK_CLOSE_DURATION_RANGE_SECONDS = [0.05, 0.085];
 const BLINK_HOLD_DURATION_RANGE_SECONDS = [0.025, 0.05];
 const BLINK_OPEN_DURATION_RANGE_SECONDS = [0.07, 0.12];
 const BLINK_EYE_SCALE_RANGE = [0.92, 1];
+const GAZE_DIRECT_HOLD_RANGE_SECONDS = [1.7, 4.2];
+const GAZE_GLANCE_HOLD_RANGE_SECONDS = [0.45, 1.1];
+const GAZE_DIRECT_YAW_RANGE_DEGREES = [-3.2, 3.2];
+const GAZE_DIRECT_PITCH_RANGE_DEGREES = [-1.4, 2.1];
+const GAZE_GLANCE_YAW_RANGE_DEGREES = [-7.5, 7.5];
+const GAZE_GLANCE_PITCH_RANGE_DEGREES = [-3.5, 3.2];
+const GAZE_GLANCE_CHANCE = 0.2;
+const GAZE_MIN_SHIFT_DURATION_SECONDS = 0.12;
+const GAZE_MAX_SHIFT_DURATION_SECONDS = 0.28;
+const GAZE_CAMERA_FORWARD_OFFSET = 0.22;
+const GAZE_MICRO_YAW_DEGREES = 0.42;
+const GAZE_MICRO_PITCH_DEGREES = 0.28;
 const HEAD_IDLE_SHIFT_INTERVAL_RANGE_SECONDS = [1.4, 3.6];
 const HEAD_IDLE_SHIFT_DURATION_RANGE_SECONDS = [0.8, 1.6];
 const HEAD_IDLE_YAW_RANGE_DEGREES = [-9.5, 9.5];
@@ -36,6 +48,10 @@ renderer.outputColorSpace = THREE.SRGBColorSpace;
 const scene = new THREE.Scene();
 scene.background = new THREE.Color('#d8e6ec');
 scene.fog = new THREE.Fog('#d8e6ec', 12, 28);
+
+const gazeTarget = new THREE.Object3D();
+gazeTarget.name = 'NaturalGazeTarget';
+scene.add(gazeTarget);
 
 const camera = new THREE.PerspectiveCamera(30, 1, 0.1, 100);
 camera.position.set(0, 1.4, 3.2);
@@ -85,8 +101,13 @@ let currentAvatarRoot = null;
 let currentMotionRoot = null;
 let currentAnimationSource = null;
 let blinkState = createBlinkState();
+let gazeState = createNaturalGazeState();
 let headIdleRig = null;
 let headIdleState = createHeadIdleState();
+const gazeOrigin = new THREE.Vector3();
+const gazeCameraForward = new THREE.Vector3();
+const gazeCameraRight = new THREE.Vector3();
+const gazeCameraUp = new THREE.Vector3();
 const headIdleWorkingEuler = new THREE.Euler(0, 0, 0, 'XYZ');
 const headIdleWorkingQuaternion = new THREE.Quaternion();
 const headIdleOffsetQuaternion = new THREE.Quaternion();
@@ -102,6 +123,12 @@ function smoothstep(value) {
 
 function degreesToRadians(value) {
   return THREE.MathUtils.degToRad(value);
+}
+
+function randomCentered(min, max) {
+  const center = (min + max) * 0.5;
+  const radius = (max - min) * 0.5;
+  return center + (Math.random() * 2 - 1) * Math.random() * radius;
 }
 
 function createBlinkState() {
@@ -124,6 +151,45 @@ function resetBlinkState() {
   applyBlinkWeight(0, 0);
 }
 
+function chooseNaturalGazeTarget(forceDirect = false) {
+  const isGlance = !forceDirect && Math.random() < GAZE_GLANCE_CHANCE;
+  const yawRange = isGlance ? GAZE_GLANCE_YAW_RANGE_DEGREES : GAZE_DIRECT_YAW_RANGE_DEGREES;
+  const pitchRange = isGlance ? GAZE_GLANCE_PITCH_RANGE_DEGREES : GAZE_DIRECT_PITCH_RANGE_DEGREES;
+
+  return {
+    yaw: randomCentered(...yawRange),
+    pitch: randomCentered(...pitchRange),
+    isGlance
+  };
+}
+
+function createNaturalGazeState() {
+  const target = chooseNaturalGazeTarget(true);
+
+  return {
+    elapsed: 0,
+    phaseElapsed: 0,
+    isShifting: false,
+    forceDirectNext: false,
+    current: { yaw: 0, pitch: 0, isGlance: false },
+    from: { yaw: 0, pitch: 0, isGlance: false },
+    target,
+    nextShiftAt: randomBetween(...GAZE_DIRECT_HOLD_RANGE_SECONDS),
+    shiftDuration: GAZE_MIN_SHIFT_DURATION_SECONDS,
+    microYawPhase: randomBetween(0, Math.PI * 2),
+    microPitchPhase: randomBetween(0, Math.PI * 2)
+  };
+}
+
+function resetNaturalGazeState() {
+  gazeState = createNaturalGazeState();
+
+  if (currentVrm?.lookAt) {
+    currentVrm.lookAt.target = null;
+    currentVrm.lookAt.reset();
+  }
+}
+
 function createHeadIdleState() {
   return {
     elapsed: 0,
@@ -142,6 +208,107 @@ function createHeadIdleState() {
 
 function resetHeadIdleState() {
   headIdleState = createHeadIdleState();
+}
+
+function scheduleNextNaturalGazeShift() {
+  const holdRange = gazeState.current.isGlance
+    ? GAZE_GLANCE_HOLD_RANGE_SECONDS
+    : GAZE_DIRECT_HOLD_RANGE_SECONDS;
+
+  gazeState.nextShiftAt = gazeState.elapsed + randomBetween(...holdRange);
+}
+
+function beginNaturalGazeShift() {
+  const target = chooseNaturalGazeTarget(gazeState.forceDirectNext);
+  const shiftDistance = Math.hypot(
+    target.yaw - gazeState.current.yaw,
+    target.pitch - gazeState.current.pitch
+  );
+
+  gazeState.isShifting = true;
+  gazeState.forceDirectNext = target.isGlance;
+  gazeState.phaseElapsed = 0;
+  gazeState.from = { ...gazeState.current };
+  gazeState.target = target;
+  gazeState.shiftDuration = THREE.MathUtils.clamp(
+    0.1 + shiftDistance * 0.014 + randomBetween(0, 0.05),
+    GAZE_MIN_SHIFT_DURATION_SECONDS,
+    GAZE_MAX_SHIFT_DURATION_SECONDS
+  );
+}
+
+function positionNaturalGazeTarget(yawDegrees, pitchDegrees) {
+  const lookAt = currentVrm?.lookAt;
+
+  if (!lookAt) {
+    return;
+  }
+
+  camera.updateMatrixWorld(true);
+  currentAvatarRoot?.updateMatrixWorld(true);
+
+  lookAt.getLookAtWorldPosition(gazeOrigin);
+  const distance = Math.max(1.2, gazeOrigin.distanceTo(camera.position));
+  const horizontalOffset = Math.tan(degreesToRadians(yawDegrees)) * distance;
+  const verticalOffset = Math.tan(degreesToRadians(pitchDegrees)) * distance;
+
+  camera.getWorldDirection(gazeCameraForward);
+  gazeCameraRight.setFromMatrixColumn(camera.matrixWorld, 0).normalize();
+  gazeCameraUp.setFromMatrixColumn(camera.matrixWorld, 1).normalize();
+
+  gazeTarget.position
+    .copy(camera.position)
+    .addScaledVector(gazeCameraForward, GAZE_CAMERA_FORWARD_OFFSET)
+    .addScaledVector(gazeCameraRight, horizontalOffset)
+    .addScaledVector(gazeCameraUp, verticalOffset);
+  gazeTarget.updateMatrixWorld(true);
+}
+
+function updateNaturalGaze(delta) {
+  if (!currentVrm?.lookAt) {
+    return;
+  }
+
+  if (currentVrm.lookAt.target !== gazeTarget) {
+    currentVrm.lookAt.target = gazeTarget;
+    currentVrm.lookAt.autoUpdate = true;
+  }
+
+  gazeState.elapsed += delta;
+
+  if (!gazeState.isShifting && gazeState.elapsed >= gazeState.nextShiftAt) {
+    beginNaturalGazeShift();
+  }
+
+  if (gazeState.isShifting) {
+    gazeState.phaseElapsed += delta;
+    const progress = Math.min(1, gazeState.phaseElapsed / gazeState.shiftDuration);
+    const eased = smoothstep(progress);
+
+    gazeState.current = {
+      yaw: THREE.MathUtils.lerp(gazeState.from.yaw, gazeState.target.yaw, eased),
+      pitch: THREE.MathUtils.lerp(gazeState.from.pitch, gazeState.target.pitch, eased),
+      isGlance: gazeState.target.isGlance
+    };
+
+    if (progress >= 1) {
+      gazeState.phaseElapsed = 0;
+      gazeState.isShifting = false;
+      scheduleNextNaturalGazeShift();
+    }
+  }
+
+  const microYaw =
+    Math.sin(gazeState.elapsed * 0.78 + gazeState.microYawPhase) *
+    GAZE_MICRO_YAW_DEGREES;
+  const microPitch =
+    Math.sin(gazeState.elapsed * 0.94 + gazeState.microPitchPhase) *
+    GAZE_MICRO_PITCH_DEGREES;
+
+  positionNaturalGazeTarget(
+    gazeState.current.yaw + microYaw,
+    gazeState.current.pitch + microPitch
+  );
 }
 
 function scheduleNextHeadIdleShift() {
@@ -425,6 +592,7 @@ function disposeCurrentModel() {
   currentMotionRoot = null;
   headIdleRig = null;
   resetHeadIdleState();
+  resetNaturalGazeState();
   applyBlinkWeight(0, 0);
   resetBlinkState();
   VRMUtils.deepDispose(currentVrm.scene);
@@ -499,6 +667,7 @@ async function loadVrm(url, label = 'default VRM') {
     VRMUtils.rotateVRM0(vrm);
     currentVrm = vrm;
     headIdleRig = setupHeadIdleRig(vrm);
+    resetNaturalGazeState();
     currentAvatarRoot = new THREE.Group();
     currentAvatarRoot.name = 'VRMAvatarRoot';
     currentMotionRoot = new THREE.Group();
@@ -568,12 +737,13 @@ function animate() {
   resizeRenderer();
 
   const delta = clock.getDelta();
+  controls.update();
   currentMixer?.update(delta);
   updateHeadIdle(delta);
+  updateNaturalGaze(delta);
   updateBlink(delta);
   currentVrm?.update(delta);
 
-  controls.update();
   renderer.render(scene, camera);
 }
 
