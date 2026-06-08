@@ -1,6 +1,7 @@
 # VRM Viewer Starter
 
 Small local web app for previewing a Vroid `.vrm` model in the browser with Three.js.
+(For now)
 
 ## What it does
 
