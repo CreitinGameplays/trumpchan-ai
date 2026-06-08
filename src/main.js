@@ -20,14 +20,14 @@ const BLINK_CLOSE_DURATION_RANGE_SECONDS = [0.05, 0.085];
 const BLINK_HOLD_DURATION_RANGE_SECONDS = [0.025, 0.05];
 const BLINK_OPEN_DURATION_RANGE_SECONDS = [0.07, 0.12];
 const BLINK_EYE_SCALE_RANGE = [0.92, 1];
-const HEAD_IDLE_SHIFT_INTERVAL_RANGE_SECONDS = [1.8, 4.5];
-const HEAD_IDLE_SHIFT_DURATION_RANGE_SECONDS = [0.9, 1.8];
-const HEAD_IDLE_YAW_RANGE_DEGREES = [-7, 7];
-const HEAD_IDLE_PITCH_RANGE_DEGREES = [-4, 3];
-const HEAD_IDLE_ROLL_RANGE_DEGREES = [-3, 3];
-const HEAD_IDLE_MICRO_YAW_DEGREES = 1.2;
-const HEAD_IDLE_MICRO_PITCH_DEGREES = 0.8;
-const HEAD_IDLE_MICRO_ROLL_DEGREES = 0.6;
+const HEAD_IDLE_SHIFT_INTERVAL_RANGE_SECONDS = [1.4, 3.6];
+const HEAD_IDLE_SHIFT_DURATION_RANGE_SECONDS = [0.8, 1.6];
+const HEAD_IDLE_YAW_RANGE_DEGREES = [-9.5, 9.5];
+const HEAD_IDLE_PITCH_RANGE_DEGREES = [-5.2, 4];
+const HEAD_IDLE_ROLL_RANGE_DEGREES = [-4.2, 4.2];
+const HEAD_IDLE_MICRO_YAW_DEGREES = 1.8;
+const HEAD_IDLE_MICRO_PITCH_DEGREES = 1.2;
+const HEAD_IDLE_MICRO_ROLL_DEGREES = 0.9;
 
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -240,23 +240,23 @@ function updateHeadIdle(delta) {
   applyBoneIdleRotation(
     headIdleRig.upperChestBone,
     headIdleBaseQuaternion,
-    pitch * 0.18,
-    yaw * 0.12,
-    roll * 0.2
+    pitch * 0.22,
+    yaw * 0.16,
+    roll * 0.24
   );
   applyBoneIdleRotation(
     headIdleRig.neckBone,
     headIdleWorkingQuaternion,
-    pitch * 0.38,
-    yaw * 0.34,
-    roll * 0.35
+    pitch * 0.42,
+    yaw * 0.39,
+    roll * 0.4
   );
   applyBoneIdleRotation(
     headIdleRig.headBone,
     headIdleWorkingQuaternion,
-    pitch * 0.44,
-    yaw * 0.54,
-    roll * 0.45
+    pitch * 0.5,
+    yaw * 0.62,
+    roll * 0.52
   );
 }
 
