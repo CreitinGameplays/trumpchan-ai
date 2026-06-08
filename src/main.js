@@ -5,18 +5,14 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
 import { loadMixamoAnimation } from './loadMixamoAnimation.js';
+import defaultVrmUrl from '../files/trumpchan.vrm?url';
+import defaultAnimationUrl from '../files/Standing-Idle.fbx?url';
 
 const canvas = document.querySelector('#scene');
-const fileInput = document.querySelector('#vrmInput');
-const animationInput = document.querySelector('#animationInput');
-const allowVerticalMotionInput = document.querySelector('#allowVerticalMotion');
-const allowFloorMotionInput = document.querySelector('#allowFloorMotion');
-const openViewerButton = document.querySelector('#openViewerButton');
-const expandViewerButton = document.querySelector('#expandViewerButton');
-const closeViewerButton = document.querySelector('#closeViewerButton');
-const resetPositionButton = document.querySelector('#resetPositionButton');
 const status = document.querySelector('#status');
-const viewerModal = document.querySelector('#viewerModal');
+
+const DEFAULT_ALLOW_VERTICAL_MOTION = true;
+const DEFAULT_ALLOW_FLOOR_MOTION = true;
 
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -68,13 +64,11 @@ loader.register((parser) => new VRMLoaderPlugin(parser));
 
 let currentVrm = null;
 let currentVrmUrl = null;
-let currentAnimationUrl = null;
-let currentAnimationFile = null;
 let currentMixer = null;
 let currentAction = null;
 let currentAvatarRoot = null;
 let currentMotionRoot = null;
-let debugFrameCounter = 0;
+let currentAnimationSource = null;
 
 function setStatus(message, isError = false) {
   status.textContent = message;
@@ -97,32 +91,6 @@ function resizeRenderer() {
   }
 }
 
-function setViewerOpen(isOpen) {
-  viewerModal.setAttribute('aria-hidden', String(!isOpen));
-  document.body.classList.toggle('viewer-open', isOpen);
-
-  if (!isOpen) {
-    viewerModal.classList.remove('viewer-modal--expanded');
-    expandViewerButton?.setAttribute('aria-label', 'Expand VRM viewer');
-    expandViewerButton?.setAttribute('title', 'Expand viewer');
-  }
-
-  if (isOpen) {
-    resizeRenderer();
-    controls.update();
-  }
-}
-
-function toggleViewerExpanded() {
-  const isExpanded = viewerModal.classList.toggle('viewer-modal--expanded');
-
-  expandViewerButton.setAttribute('aria-label', isExpanded ? 'Shrink VRM viewer' : 'Expand VRM viewer');
-  expandViewerButton.setAttribute('title', isExpanded ? 'Shrink viewer' : 'Expand viewer');
-
-  resizeRenderer();
-  controls.update();
-}
-
 function disposeCurrentModel() {
   if (currentAction) {
     currentAction.stop();
@@ -134,7 +102,9 @@ function disposeCurrentModel() {
     currentMixer = null;
   }
 
-  if (!currentVrm) return;
+  if (!currentVrm) {
+    return;
+  }
 
   if (currentAvatarRoot) {
     scene.remove(currentAvatarRoot);
@@ -145,10 +115,11 @@ function disposeCurrentModel() {
   VRMUtils.deepDispose(currentVrm.scene);
   currentVrm = null;
 
-  if (currentVrmUrl) {
+  if (currentVrmUrl?.startsWith('blob:')) {
     URL.revokeObjectURL(currentVrmUrl);
-    currentVrmUrl = null;
   }
+
+  currentVrmUrl = null;
 }
 
 function disposeCurrentAnimation() {
@@ -162,9 +133,8 @@ function disposeCurrentAnimation() {
     currentMixer = null;
   }
 
-  if (currentAnimationUrl) {
-    URL.revokeObjectURL(currentAnimationUrl);
-    currentAnimationUrl = null;
+  if (currentAnimationSource?.url?.startsWith('blob:')) {
+    URL.revokeObjectURL(currentAnimationSource.url);
   }
 }
 
@@ -196,13 +166,13 @@ function resetModelPosition() {
   }
 }
 
-async function loadVrm(file) {
+async function loadVrm(url, label = 'default VRM') {
   disposeCurrentModel();
-  currentVrmUrl = URL.createObjectURL(file);
-  setStatus(`Loading ${file.name}...`);
+  currentVrmUrl = url;
+  setStatus(`Loading ${label}...`);
 
   try {
-    const gltf = await loader.loadAsync(currentVrmUrl);
+    const gltf = await loader.loadAsync(url);
     const vrm = gltf.userData.vrm;
 
     if (!vrm) {
@@ -226,10 +196,10 @@ async function loadVrm(file) {
 
     frameModel(currentAvatarRoot);
 
-    if (currentAnimationFile) {
-      await loadAnimation(currentAnimationFile, false);
+    if (currentAnimationSource) {
+      await loadAnimation(currentAnimationSource.url, currentAnimationSource.name);
     } else {
-      setStatus(`Loaded ${file.name}`);
+      setStatus(`Loaded ${label}.`);
     }
   } catch (error) {
     disposeCurrentModel();
@@ -237,22 +207,21 @@ async function loadVrm(file) {
   }
 }
 
-async function loadAnimation(file, updateInput = true) {
+async function loadAnimation(url, label = 'default animation') {
+  currentAnimationSource = { url, name: label };
+
   if (!currentVrm) {
-    currentAnimationFile = file;
-    setStatus('Animation queued. Load a VRM model to apply it.', false);
+    setStatus(`Queued ${label} until the VRM finishes loading.`);
     return;
   }
 
   disposeCurrentAnimation();
-  currentAnimationFile = file;
-  currentAnimationUrl = URL.createObjectURL(file);
-  setStatus(`Loading animation ${file.name}...`);
+  setStatus(`Loading animation ${label}...`);
 
   try {
-    const clip = await loadMixamoAnimation(currentAnimationUrl, currentVrm, {
-      allowVerticalMotion: allowVerticalMotionInput.checked,
-      allowFloorMotion: allowFloorMotionInput.checked,
+    const clip = await loadMixamoAnimation(url, currentVrm, {
+      allowVerticalMotion: DEFAULT_ALLOW_VERTICAL_MOTION,
+      allowFloorMotion: DEFAULT_ALLOW_FLOOR_MOTION,
       rootMotionNodeName: currentMotionRoot?.name ?? null
     });
 
@@ -261,90 +230,16 @@ async function loadAnimation(file, updateInput = true) {
     currentAction.reset();
     currentAction.play();
 
-    if (updateInput) {
-      animationInput.value = '';
-    }
-
-    setStatus(`Loaded ${currentVrm.scene.name || 'VRM model'} with animation ${file.name}`);
+    setStatus(`Loaded ${currentVrm.scene.name || 'VRM model'} with ${label}. Press R to reset position.`);
   } catch (error) {
     disposeCurrentAnimation();
     setStatus(error instanceof Error ? error.message : 'Failed to load animation.', true);
   }
 }
 
-fileInput.addEventListener('change', async (event) => {
-  const file = event.target.files?.[0];
-  if (!file) return;
-
-  if (!file.name.toLowerCase().endsWith('.vrm')) {
-    setStatus('Please choose a .vrm file.', true);
-    return;
-  }
-
-  await loadVrm(file);
-});
-
-animationInput.addEventListener('change', async (event) => {
-  const file = event.target.files?.[0];
-  if (!file) return;
-
-  if (!file.name.toLowerCase().endsWith('.fbx')) {
-    setStatus('Please choose a Mixamo .fbx animation file.', true);
-    return;
-  }
-
-  await loadAnimation(file);
-});
-
-allowVerticalMotionInput.addEventListener('change', async () => {
-  if (!currentAnimationFile || !currentVrm) {
-    return;
-  }
-
-  await loadAnimation(currentAnimationFile, false);
-});
-
-allowFloorMotionInput.addEventListener('change', async () => {
-  if (!currentMotionRoot) {
-    return;
-  }
-
-  currentMotionRoot.position.set(0, 0, 0);
-
-  if (!currentAnimationFile || !currentVrm) {
-    return;
-  }
-
-  await loadAnimation(currentAnimationFile, false);
-});
-
-resetPositionButton.addEventListener('click', () => {
-  resetModelPosition();
-});
-
-openViewerButton.addEventListener('click', () => {
-  setViewerOpen(true);
-});
-
-expandViewerButton.addEventListener('click', () => {
-  toggleViewerExpanded();
-});
-
-closeViewerButton.addEventListener('click', () => {
-  setViewerOpen(false);
-});
-
-viewerModal.addEventListener('click', (event) => {
-  const target = event.target;
-
-  if (target instanceof HTMLElement && target.dataset.closeViewer === 'true') {
-    setViewerOpen(false);
-  }
-});
-
 window.addEventListener('keydown', (event) => {
-  if (event.key === 'Escape' && viewerModal.getAttribute('aria-hidden') === 'false') {
-    setViewerOpen(false);
+  if (event.key.toLowerCase() === 'r') {
+    resetModelPosition();
   }
 });
 
@@ -358,27 +253,15 @@ function animate() {
   currentMixer?.update(delta);
   currentVrm?.update(delta);
 
-  if (currentVrm && currentAction) {
-    debugFrameCounter += 1;
-
-    if (debugFrameCounter % 120 === 0) {
-      const box = new THREE.Box3().setFromObject(currentAvatarRoot ?? currentVrm.scene);
-      const center = box.getCenter(new THREE.Vector3());
-      const size = box.getSize(new THREE.Vector3());
-
-      console.info('VRM scene debug:', {
-        center: center.toArray(),
-        size: size.toArray(),
-        cameraPosition: camera.position.toArray(),
-        controlTarget: controls.target.toArray(),
-        rootPosition: currentMotionRoot?.position.toArray()
-      });
-    }
-  }
-
   controls.update();
   renderer.render(scene, camera);
 }
 
+async function initializeViewer() {
+  currentAnimationSource = { url: defaultAnimationUrl, name: 'Standing-Idle.fbx' };
+  await loadVrm(defaultVrmUrl, 'trumpchan.vrm');
+}
+
 window.addEventListener('resize', resizeRenderer);
 animate();
+initializeViewer();
