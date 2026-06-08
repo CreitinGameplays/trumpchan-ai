@@ -1,14 +1,16 @@
-# VRM Viewer Starter
+# Trumpchan
 
-Small local web app for previewing a bundled Vroid `.vrm` model in the browser with Three.js.
+Simple browser-based AI anime assistant surface for Trumpchan, built with Three.js.
 
 ## What it does
 
 - Starts a local dev server on `localhost`
-- Displays the model with basic lighting and orbit controls
+- Presents Trumpchan as a simple in-browser anime assistant surface
+- Displays the character with basic lighting and orbit controls
 - Automatically loads `files/trumpchan.vrm` on startup
 - Automatically applies `files/Standing-Idle.fbx` on startup
 - Keeps vertical motion and floor movement enabled by default
+- Does not include any AI or LLM backend yet
 
 ## Requirements
 
@@ -44,7 +46,7 @@ http://localhost:5173
 
 1. Start the dev server.
 2. Open the app in your browser.
-3. The viewer loads `trumpchan.vrm` automatically.
+3. Trumpchan loads automatically.
 4. The idle loop from `Standing-Idle.fbx` starts automatically.
 5. Orbit, pan, and zoom the camera with your mouse.
 6. Press `R` if you want to reset the avatar back to its starting position.
@@ -59,7 +61,7 @@ http://localhost:5173
 ## Project files
 
 - `index.html` - app shell
-- `src/main.js` - Three.js + VRM viewer logic
+- `src/main.js` - Three.js + Trumpchan viewer logic
 - `src/loadMixamoAnimation.js` - Mixamo FBX retargeting for VRM humanoid bones
 - `src/mixamoVRMRigMap.js` - Mixamo-to-VRM bone mapping
 - `src/style.css` - page styling
