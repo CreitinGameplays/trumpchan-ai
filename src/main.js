@@ -20,6 +20,14 @@ const BLINK_CLOSE_DURATION_RANGE_SECONDS = [0.05, 0.085];
 const BLINK_HOLD_DURATION_RANGE_SECONDS = [0.025, 0.05];
 const BLINK_OPEN_DURATION_RANGE_SECONDS = [0.07, 0.12];
 const BLINK_EYE_SCALE_RANGE = [0.92, 1];
+const HEAD_IDLE_SHIFT_INTERVAL_RANGE_SECONDS = [1.8, 4.5];
+const HEAD_IDLE_SHIFT_DURATION_RANGE_SECONDS = [0.9, 1.8];
+const HEAD_IDLE_YAW_RANGE_DEGREES = [-7, 7];
+const HEAD_IDLE_PITCH_RANGE_DEGREES = [-4, 3];
+const HEAD_IDLE_ROLL_RANGE_DEGREES = [-3, 3];
+const HEAD_IDLE_MICRO_YAW_DEGREES = 1.2;
+const HEAD_IDLE_MICRO_PITCH_DEGREES = 0.8;
+const HEAD_IDLE_MICRO_ROLL_DEGREES = 0.6;
 
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -77,9 +85,23 @@ let currentAvatarRoot = null;
 let currentMotionRoot = null;
 let currentAnimationSource = null;
 let blinkState = createBlinkState();
+let headIdleRig = null;
+let headIdleState = createHeadIdleState();
+const headIdleWorkingEuler = new THREE.Euler(0, 0, 0, 'XYZ');
+const headIdleWorkingQuaternion = new THREE.Quaternion();
+const headIdleOffsetQuaternion = new THREE.Quaternion();
+const headIdleBaseQuaternion = new THREE.Quaternion();
 
 function randomBetween(min, max) {
   return min + Math.random() * (max - min);
+}
+
+function smoothstep(value) {
+  return value * value * (3 - 2 * value);
+}
+
+function degreesToRadians(value) {
+  return THREE.MathUtils.degToRad(value);
 }
 
 function createBlinkState() {
@@ -100,6 +122,142 @@ function createBlinkState() {
 function resetBlinkState() {
   blinkState = createBlinkState();
   applyBlinkWeight(0, 0);
+}
+
+function createHeadIdleState() {
+  return {
+    elapsed: 0,
+    phaseElapsed: 0,
+    isShifting: false,
+    current: { yaw: 0, pitch: 0, roll: 0 },
+    from: { yaw: 0, pitch: 0, roll: 0 },
+    target: { yaw: 0, pitch: 0, roll: 0 },
+    nextShiftAt: randomBetween(...HEAD_IDLE_SHIFT_INTERVAL_RANGE_SECONDS),
+    shiftDuration: randomBetween(...HEAD_IDLE_SHIFT_DURATION_RANGE_SECONDS),
+    microYawPhase: randomBetween(0, Math.PI * 2),
+    microPitchPhase: randomBetween(0, Math.PI * 2),
+    microRollPhase: randomBetween(0, Math.PI * 2)
+  };
+}
+
+function resetHeadIdleState() {
+  headIdleState = createHeadIdleState();
+}
+
+function scheduleNextHeadIdleShift() {
+  headIdleState.nextShiftAt =
+    headIdleState.elapsed + randomBetween(...HEAD_IDLE_SHIFT_INTERVAL_RANGE_SECONDS);
+  headIdleState.shiftDuration = randomBetween(...HEAD_IDLE_SHIFT_DURATION_RANGE_SECONDS);
+}
+
+function beginHeadIdleShift() {
+  headIdleState.isShifting = true;
+  headIdleState.phaseElapsed = 0;
+  headIdleState.from = { ...headIdleState.current };
+  headIdleState.target = {
+    yaw: degreesToRadians(randomBetween(...HEAD_IDLE_YAW_RANGE_DEGREES)),
+    pitch: degreesToRadians(randomBetween(...HEAD_IDLE_PITCH_RANGE_DEGREES)),
+    roll: degreesToRadians(randomBetween(...HEAD_IDLE_ROLL_RANGE_DEGREES))
+  };
+}
+
+function setupHeadIdleRig(vrm) {
+  const humanoid = vrm?.humanoid;
+
+  if (!humanoid) {
+    return null;
+  }
+
+  const upperChestBone =
+    humanoid.getNormalizedBoneNode('upperChest') ??
+    humanoid.getNormalizedBoneNode('chest') ??
+    humanoid.getNormalizedBoneNode('spine');
+  const neckBone = humanoid.getNormalizedBoneNode('neck');
+  const headBone = humanoid.getNormalizedBoneNode('head');
+
+  return {
+    upperChestBone,
+    neckBone,
+    headBone
+  };
+}
+
+function applyBoneIdleRotation(bone, baseQuaternion, pitch, yaw, roll) {
+  if (!bone) {
+    return;
+  }
+
+  headIdleWorkingEuler.set(pitch, yaw, roll);
+  headIdleOffsetQuaternion.setFromEuler(headIdleWorkingEuler);
+  baseQuaternion.copy(bone.quaternion);
+  bone.quaternion.copy(baseQuaternion.multiply(headIdleOffsetQuaternion));
+}
+
+function updateHeadIdle(delta) {
+  if (!headIdleRig) {
+    return;
+  }
+
+  headIdleState.elapsed += delta;
+
+  if (!headIdleState.isShifting && headIdleState.elapsed >= headIdleState.nextShiftAt) {
+    beginHeadIdleShift();
+  }
+
+  if (headIdleState.isShifting) {
+    headIdleState.phaseElapsed += delta;
+    const progress = Math.min(1, headIdleState.phaseElapsed / headIdleState.shiftDuration);
+    const eased = smoothstep(progress);
+
+    headIdleState.current = {
+      yaw: THREE.MathUtils.lerp(headIdleState.from.yaw, headIdleState.target.yaw, eased),
+      pitch: THREE.MathUtils.lerp(headIdleState.from.pitch, headIdleState.target.pitch, eased),
+      roll: THREE.MathUtils.lerp(headIdleState.from.roll, headIdleState.target.roll, eased)
+    };
+
+    if (progress >= 1) {
+      headIdleState.phaseElapsed = 0;
+      headIdleState.isShifting = false;
+      scheduleNextHeadIdleShift();
+    }
+  }
+
+  const elapsed = headIdleState.elapsed;
+  const microYaw =
+    Math.sin(elapsed * 0.65 + headIdleState.microYawPhase) *
+    degreesToRadians(HEAD_IDLE_MICRO_YAW_DEGREES);
+  const microPitch =
+    Math.sin(elapsed * 0.92 + headIdleState.microPitchPhase) *
+    degreesToRadians(HEAD_IDLE_MICRO_PITCH_DEGREES);
+  const microRoll =
+    Math.sin(elapsed * 0.51 + headIdleState.microRollPhase) *
+    degreesToRadians(HEAD_IDLE_MICRO_ROLL_DEGREES);
+
+  const yaw = headIdleState.current.yaw + microYaw;
+  const pitch = headIdleState.current.pitch + microPitch;
+  const roll = headIdleState.current.roll + microRoll;
+
+  applyBoneIdleRotation(
+    headIdleRig.upperChestBone,
+    headIdleBaseQuaternion,
+    pitch * 0.18,
+    yaw * 0.12,
+    roll * 0.2
+  );
+  applyBoneIdleRotation(
+    headIdleRig.neckBone,
+    headIdleWorkingQuaternion,
+    pitch * 0.38,
+    yaw * 0.34,
+    roll * 0.35
+  );
+  applyBoneIdleRotation(
+    headIdleRig.headBone,
+    headIdleWorkingQuaternion,
+    pitch * 0.44,
+    yaw * 0.54,
+    roll * 0.45
+  );
 }
 
 function scheduleNextBlink(isDoubleBlink = false) {
@@ -265,6 +423,8 @@ function disposeCurrentModel() {
   }
 
   currentMotionRoot = null;
+  headIdleRig = null;
+  resetHeadIdleState();
   applyBlinkWeight(0, 0);
   resetBlinkState();
   VRMUtils.deepDispose(currentVrm.scene);
@@ -324,6 +484,7 @@ function resetModelPosition() {
 async function loadVrm(url, label = 'default VRM') {
   disposeCurrentModel();
   currentVrmUrl = url;
+  resetHeadIdleState();
   resetBlinkState();
   setStatus(`Loading ${label}...`);
 
@@ -337,6 +498,7 @@ async function loadVrm(url, label = 'default VRM') {
 
     VRMUtils.rotateVRM0(vrm);
     currentVrm = vrm;
+    headIdleRig = setupHeadIdleRig(vrm);
     currentAvatarRoot = new THREE.Group();
     currentAvatarRoot.name = 'VRMAvatarRoot';
     currentMotionRoot = new THREE.Group();
@@ -407,6 +569,7 @@ function animate() {
 
   const delta = clock.getDelta();
   currentMixer?.update(delta);
+  updateHeadIdle(delta);
   updateBlink(delta);
   currentVrm?.update(delta);
 
