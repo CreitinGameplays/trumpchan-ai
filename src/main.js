@@ -5,7 +5,7 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
 import { loadMixamoAnimation } from './loadMixamoAnimation.js';
-import defaultVrmUrl from '../files/trumpchan.vrm?url';
+import defaultVrmUrl from '../files/Pati.vrm?url';
 import defaultAnimationUrl from '../files/Standing-Idle.fbx?url';
 
 const canvas = document.querySelector('#scene');
@@ -717,7 +717,7 @@ async function loadAnimation(url, label = 'default animation') {
     currentAction.reset();
     currentAction.play();
 
-    setStatus(`Loaded ${currentVrm.scene.name || 'VRM model'} with ${label}. Press R to reset position.`);
+    setStatus(`Press R to reset position.`);
   } catch (error) {
     disposeCurrentAnimation();
     setStatus(error instanceof Error ? error.message : 'Failed to load animation.', true);
@@ -749,7 +749,7 @@ function animate() {
 
 async function initializeViewer() {
   currentAnimationSource = { url: defaultAnimationUrl, name: 'Standing-Idle.fbx' };
-  await loadVrm(defaultVrmUrl, 'trumpchan.vrm');
+  await loadVrm(defaultVrmUrl, 'Pati.vrm');
 }
 
 window.addEventListener('resize', resizeRenderer);
