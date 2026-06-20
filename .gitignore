@@ -1,3 +1,7 @@
 node_modules/
 dist/
 files/**
+build/**
+.env
+.venv/**
+.venv
