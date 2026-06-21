@@ -13,8 +13,11 @@
   "dependencies": {
     "@google/genai": "^2.9.0",
     "@pixiv/three-vrm": "^3.4.2",
+    "cors": "^2.8.6",
     "dotenv": "^17.4.2",
-    "three": "^0.181.1"
+    "express": "^5.2.1",
+    "three": "^0.181.1",
+    "ws": "^8.21.0"
   },
   "devDependencies": {
     "@types/node": "^26.0.0",

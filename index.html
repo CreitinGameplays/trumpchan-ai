@@ -8,10 +8,17 @@
   </head>
   <body>
     <main id="app" class="viewer-shell">
+      <div id="captions" class="viewer-captions" aria-live="polite"></div>
+      
       <canvas id="scene" aria-label="Trumpchan"></canvas>
       <div class="viewer-status" aria-live="polite">
         <p class="viewer-status__title">AI</p>
         <p id="status" class="viewer-status__message">Loading default model...</p>
+      </div>
+
+      <div class="viewer-chat" id="chat">
+        <input type="text" id="chat-input" placeholder="Say something..." autocomplete="off">
+        <button id="chat-send">Send</button>
       </div>
     </main>
   </body>

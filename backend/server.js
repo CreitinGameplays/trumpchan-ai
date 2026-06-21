@@ -17,6 +17,22 @@ let clients = [];
 wss.on('connection', (ws) => {
     console.log('Client connected to WebSocket');
     clients.push(ws);
+
+    ws.on('message', (message) => {
+        try {
+            const data = JSON.parse(message);
+            // Broadcast to other clients (e.g. from AI Server to Frontend)
+            const outMessage = JSON.stringify(data);
+            clients.forEach(client => {
+                if (client !== ws && client.readyState === 1) { // 1 = OPEN
+                    client.send(outMessage);
+                }
+            });
+        } catch (e) {
+            console.error('Invalid message format received via WS', e);
+        }
+    });
+
     ws.on('close', () => {
         console.log('Client disconnected');
         clients = clients.filter(c => c !== ws);

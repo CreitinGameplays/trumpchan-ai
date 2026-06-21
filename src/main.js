@@ -717,18 +717,12 @@ async function loadAnimation(url, label = 'default animation') {
     currentAction.reset();
     currentAction.play();
 
-    setStatus(`Press R to reset position.`);
+
   } catch (error) {
     disposeCurrentAnimation();
     setStatus(error instanceof Error ? error.message : 'Failed to load animation.', true);
   }
 }
-
-window.addEventListener('keydown', (event) => {
-  if (event.key.toLowerCase() === 'r') {
-    resetModelPosition();
-  }
-});
 
 const clock = new THREE.Clock();
 
@@ -742,6 +736,7 @@ function animate() {
   updateHeadIdle(delta);
   updateNaturalGaze(delta);
   updateBlink(delta);
+  updateLipSync(); // Added AI lip sync driven by Web Audio Analyser RMS volume
   currentVrm?.update(delta);
 
   renderer.render(scene, camera);
@@ -752,20 +747,107 @@ async function initializeViewer() {
   await loadVrm(defaultVrmUrl, 'Pati.vrm');
 }
 
-window.addEventListener('resize', resizeRenderer);
-animate();
-initializeViewer();
+// Bootstrapping moved to bottom to avoid TDZ for variables
+
+// Audio context components
+let audioCtx;
+let analyser;
+let audioStartTime = 0;
+const lipSyncDataArray = new Uint8Array(128); // frequency bin count
+
+function initAudio() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 256;
+    analyser.connect(audioCtx.destination);
+  }
+}
+
+async function playAudioData(base64Pcm) {
+  initAudio();
+  const binaryString = atob(base64Pcm);
+  const len = binaryString.length;
+  // 16-bit PCM = 2 bytes per sample
+  const floatArray = new Float32Array(len / 2);
+  for (let i = 0; i < len / 2; i++) {
+    // Little endian 16-bit to Float32
+    let int16 = binaryString.charCodeAt(i * 2) + (binaryString.charCodeAt(i * 2 + 1) << 8);
+    if (int16 > 32767) int16 -= 65536;
+    floatArray[i] = int16 / 32768.0;
+  }
+
+  const audioBuffer = audioCtx.createBuffer(1, floatArray.length, 24000);
+  audioBuffer.copyToChannel(floatArray, 0);
+
+  const source = audioCtx.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(analyser); // connect to analyser which connects to destination
+
+  // Basic scheduling to avoid overlapping/gaps
+  const currentTime = audioCtx.currentTime;
+  if (audioStartTime < currentTime) audioStartTime = currentTime;
+  source.start(audioStartTime);
+  audioStartTime += audioBuffer.duration;
+}
+
+function getEnergy(dataArray, binStart, binEnd) {
+  let sum = 0;
+  for (let i = binStart; i < binEnd; i++) {
+    sum += dataArray[i];
+  }
+  return sum / (binEnd - binStart);
+}
+
+function updateLipSync() {
+  if (analyser && currentVrm && currentVrm.expressionManager) {
+    analyser.getByteFrequencyData(lipSyncDataArray);
+
+    // Overall volume
+    let sum = 0;
+    for (let i = 0; i < lipSyncDataArray.length; i++) { sum += lipSyncDataArray[i]; }
+    const totalVol = sum / lipSyncDataArray.length;
+
+    // Reset all facial blendshapes
+    currentVrm.expressionManager.setValue('aa', 0);
+    currentVrm.expressionManager.setValue('ee', 0);
+    currentVrm.expressionManager.setValue('ih', 0);
+    currentVrm.expressionManager.setValue('oh', 0);
+    currentVrm.expressionManager.setValue('ou', 0);
+
+    if (totalVol > 2) {
+      // 24000 sample rate / 256 fftSize = 93.75 Hz per bin
+      const ouEnergy = getEnergy(lipSyncDataArray, 2, 5);   // ~200-450 Hz
+      const ohEnergy = getEnergy(lipSyncDataArray, 5, 8);   // ~450-750 Hz
+      const aaEnergy = getEnergy(lipSyncDataArray, 8, 14);  // ~750-1300 Hz
+      const eeEnergy = getEnergy(lipSyncDataArray, 16, 30); // ~1500-2800 Hz
+
+      const m = 0.5;
+      let aa = (aaEnergy / 255.0) * m;
+      let ee = (eeEnergy / 255.0) * m * 0.8;
+      let oh = (ohEnergy / 255.0) * m * 0.9;
+      let ou = (ouEnergy / 255.0) * m * 0.6;
+
+      currentVrm.expressionManager.setValue('aa', Math.min(1, aa));
+      currentVrm.expressionManager.setValue('ee', Math.min(1, ee));
+      currentVrm.expressionManager.setValue('oh', Math.min(1, oh));
+      currentVrm.expressionManager.setValue('ou', Math.min(1, ou));
+    }
+  }
+}
+
+let globalWs = null;
 
 // WebSocket API Client
 function connectApiServer() {
-  const ws = new WebSocket('ws://localhost:3000');
+  globalWs = new WebSocket('ws://localhost:3000');
 
-  ws.onopen = () => {
+  globalWs.onopen = () => {
     console.log('Connected to VRoid API Server');
     setStatus('Ready (API Connected)');
   };
 
-  ws.onmessage = (event) => {
+  globalWs.onmessage = (event) => {
     try {
       const data = JSON.parse(event.data);
       handleApiCommand(data);
@@ -774,16 +856,48 @@ function connectApiServer() {
     }
   };
 
-  ws.onclose = () => {
+  globalWs.onclose = () => {
     console.log('WS disconnected, retrying in 2s...');
     setTimeout(connectApiServer, 2000);
   };
+}
+
+// Chat UI Event Listeners
+const chatInput = document.getElementById('chat-input');
+const chatSend = document.getElementById('chat-send');
+
+function sendChatMessage() {
+  const text = chatInput.value.trim();
+  if (text) {
+    if (globalWs && globalWs.readyState === 1) { // OPEN
+      globalWs.send(JSON.stringify({ type: 'chatMessage', text }));
+      chatInput.value = '';
+      initAudio(); // Initialize audio context on explicit user gesture
+    }
+  }
+}
+
+if (chatSend && chatInput) {
+  chatSend.addEventListener('click', sendChatMessage);
+  chatInput.addEventListener('keypress', (e) => {
+    if (e.key === 'Enter') sendChatMessage();
+  });
 }
 
 let apiGazeTarget = null;
 
 function handleApiCommand(cmd) {
   switch (cmd.type) {
+    case 'audio':
+      if (cmd.data) playAudioData(cmd.data);
+      break;
+    case 'caption':
+      if (cmd.text !== undefined) {
+        const captionsEl = document.getElementById('captions');
+        captionsEl.textContent = cmd.text;
+        captionsEl.style.display = cmd.text.trim() === '' ? 'none' : 'block';
+      }
+      break;
     case 'expression':
       if (currentVrm && currentVrm.expressionManager) {
         currentVrm.expressionManager.setValue(cmd.expression, cmd.value);
@@ -815,4 +929,9 @@ function handleApiCommand(cmd) {
 }
 
 connectApiServer();
+
+// Bootstrap application
+window.addEventListener('resize', resizeRenderer);
+animate();
+initializeViewer();
 
