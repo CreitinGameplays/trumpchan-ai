@@ -755,3 +755,64 @@ async function initializeViewer() {
 window.addEventListener('resize', resizeRenderer);
 animate();
 initializeViewer();
+
+// WebSocket API Client
+function connectApiServer() {
+  const ws = new WebSocket('ws://localhost:3000');
+
+  ws.onopen = () => {
+    console.log('Connected to VRoid API Server');
+    setStatus('Ready (API Connected)');
+  };
+
+  ws.onmessage = (event) => {
+    try {
+      const data = JSON.parse(event.data);
+      handleApiCommand(data);
+    } catch (e) {
+      console.error('Failed to parse WS message', e);
+    }
+  };
+
+  ws.onclose = () => {
+    console.log('WS disconnected, retrying in 2s...');
+    setTimeout(connectApiServer, 2000);
+  };
+}
+
+let apiGazeTarget = null;
+
+function handleApiCommand(cmd) {
+  switch (cmd.type) {
+    case 'expression':
+      if (currentVrm && currentVrm.expressionManager) {
+        currentVrm.expressionManager.setValue(cmd.expression, cmd.value);
+      }
+      break;
+    case 'lookAt':
+      if (cmd.target && currentVrm && currentVrm.lookAt) {
+        // Disable natural gaze shifts temporarily to focus on explicit target
+        gazeState.nextShiftAt = gazeState.elapsed + 10;
+
+        if (!apiGazeTarget) {
+          apiGazeTarget = new THREE.Object3D();
+          scene.add(apiGazeTarget);
+        }
+        apiGazeTarget.position.set(cmd.target.x, cmd.target.y, cmd.target.z);
+        currentVrm.lookAt.target = apiGazeTarget;
+      }
+      break;
+    case 'loadVrm':
+      if (cmd.url) loadVrm(cmd.url, 'API Loaded VRM');
+      break;
+    case 'loadAnimation':
+      if (cmd.url) loadAnimation(cmd.url, 'API Loaded Anim');
+      break;
+    case 'resetPosition':
+      resetModelPosition();
+      break;
+  }
+}
+
+connectApiServer();
+

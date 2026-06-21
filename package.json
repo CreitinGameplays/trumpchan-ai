@@ -4,7 +4,9 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "concurrently \"npm run dev:vite\" \"npm run dev:server\"",
+    "dev:vite": "vite",
+    "dev:server": "node backend/server.js",
     "build": "vite build",
     "preview": "vite preview"
   },
@@ -16,6 +18,7 @@
   },
   "devDependencies": {
     "@types/node": "^26.0.0",
+    "concurrently": "^10.0.3",
     "vite": "^7.1.3"
   }
 }
