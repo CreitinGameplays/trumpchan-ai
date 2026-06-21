@@ -1,6 +1,7 @@
 // To run this code you need to install the following dependencies:
 // npm install @google/genai
 // npm install -D @types/node
+// you will need to study google gemini api
 import {
   GoogleGenAI,
   LiveServerMessage,
