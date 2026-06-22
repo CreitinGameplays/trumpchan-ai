@@ -15,6 +15,7 @@ Simple browser-based AI anime assistant surface for Trumpchan, built with Three.
 ## Requirements
 
 - Node.js 18+ recommended
+- ffmpeg
 
 ## Install
 
