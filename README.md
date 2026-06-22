@@ -73,4 +73,12 @@ http://localhost:5173
 npm.cmd run build
 ```
 
+## `.env` template:
+```
+GEMINI_API_KEY=api-key-here
+FFMPEG_BINARY=ffmpeg
+VOICE_CHANGER_CONFIG=/path/to/voice-changer-config.json
+VOICE_CHANGER_ENABLED=true/false
+```
+
 The production files will be created in `dist/`.
