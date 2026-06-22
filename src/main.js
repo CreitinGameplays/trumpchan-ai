@@ -703,7 +703,7 @@ async function loadAnimation(url, label = 'default animation') {
   }
 
   disposeCurrentAnimation();
-  setStatus(`Loading animation ${label}...`);
+  // setStatus(`Loading animation ${label}...`);
 
   try {
     const clip = await loadMixamoAnimation(url, currentVrm, {

@@ -4,6 +4,7 @@ import { existsSync, mkdirSync } from 'fs';
 import * as path from 'path';
 import * as dotenv from 'dotenv';
 import WebSocket from 'ws';
+import { VoiceChanger } from './voice-changer.js';
 
 // Load environment variables
 dotenv.config();
@@ -28,6 +29,17 @@ let aiWsClient: WebSocket | undefined = undefined;
 const responseQueue: LiveServerMessage[] = [];
 let currentGlobalCaption = "";
 let captionClearTimeout: any = null;
+
+const ffmpegBinary = process.env.FFMPEG_BINARY || 'ffmpeg';
+const voiceChangerConfigPath = process.env.VOICE_CHANGER_CONFIG || path.resolve('voice-changer-config.json');
+const voiceChanger = new VoiceChanger(ffmpegBinary, voiceChangerConfigPath, (processedPcm: Buffer) => {
+    if (aiWsClient && aiWsClient.readyState === WebSocket.OPEN) {
+        aiWsClient.send(JSON.stringify({
+            type: 'audio',
+            data: processedPcm.toString('base64')
+        }));
+    }
+});
 
 async function loadHistory() {
     try {
@@ -72,7 +84,7 @@ async function startAiServer() {
         speechConfig: {
             voiceConfig: {
                 prebuiltVoiceConfig: {
-                    voiceName: 'Zephyr',
+                    voiceName: 'Laomedeia',
                 }
             }
         },
@@ -149,12 +161,8 @@ async function handleModelTurn(message: LiveServerMessage) {
     if (sc?.modelTurn?.parts) {
         for (const part of sc.modelTurn.parts) {
             if (part?.inlineData && part.inlineData.data) {
-                if (aiWsClient && aiWsClient.readyState === WebSocket.OPEN) {
-                    aiWsClient.send(JSON.stringify({
-                        type: 'audio',
-                        data: part.inlineData.data
-                    }));
-                }
+                const pcmBuffer = Buffer.from(part.inlineData.data, 'base64');
+                voiceChanger.process(pcmBuffer);
             }
         }
     }
@@ -172,26 +180,29 @@ async function handleModelTurn(message: LiveServerMessage) {
     }
 
     // turnComplete = the model just truly finished speaking this turn
-    if (sc?.turnComplete === true && currentGlobalCaption.trim() !== '') {
-        console.log(`[AI]: ${currentGlobalCaption.trim()}`);
+    if (sc?.turnComplete === true) {
+        voiceChanger.reset();
+        if (currentGlobalCaption.trim() !== '') {
+            console.log(`[AI]: ${currentGlobalCaption.trim()}`);
 
-        // Save turn to memory
-        const capturedCaption = currentGlobalCaption.trim();
-        loadHistory().then(history => {
-            history.push({ role: 'model', text: capturedCaption, timestamp: new Date().toISOString() });
-            saveHistory(history);
-        });
+            // Save turn to memory
+            const capturedCaption = currentGlobalCaption.trim();
+            loadHistory().then(history => {
+                history.push({ role: 'model', text: capturedCaption, timestamp: new Date().toISOString() });
+                saveHistory(history);
+            });
 
-        // Clear any stale rolling timeout
-        if (captionClearTimeout) clearTimeout(captionClearTimeout);
+            // Clear any stale rolling timeout
+            if (captionClearTimeout) clearTimeout(captionClearTimeout);
 
-        // Hold caption on screen for 3s after AI stops, then hide
-        captionClearTimeout = setTimeout(() => {
-            currentGlobalCaption = "";
-            if (aiWsClient && aiWsClient.readyState === WebSocket.OPEN) {
-                aiWsClient.send(JSON.stringify({ type: 'caption', text: '' }));
-            }
-        }, 3000);
+            // Hold caption on screen for 3s after AI stops, then hide
+            captionClearTimeout = setTimeout(() => {
+                currentGlobalCaption = "";
+                if (aiWsClient && aiWsClient.readyState === WebSocket.OPEN) {
+                    aiWsClient.send(JSON.stringify({ type: 'caption', text: '' }));
+                }
+            }, 3000);
+        }
     }
 
     // Handle input transcription (log what user said via mic, if ever used)

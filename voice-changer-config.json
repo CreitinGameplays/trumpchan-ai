@@ -1,0 +1,5 @@
+{
+  "enabled": true,
+  "name": "anime-pitch",
+  "ffmpegFilter": "rubberband=pitch=1.05"
+}
