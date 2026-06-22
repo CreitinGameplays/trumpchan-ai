@@ -50,7 +50,6 @@ http://localhost:5173
 3. Trumpchan loads automatically.
 4. The idle loop from `Standing-Idle.fbx` starts automatically.
 5. Orbit, pan, and zoom the camera with your mouse.
-6. Press `R` if you want to reset the avatar back to its starting position.
 
 ## Mixamo notes
 
