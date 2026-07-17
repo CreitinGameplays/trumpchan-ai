@@ -10,3 +10,4 @@ venv
 *.wav
 memory/
 tmp/**
+.DS_Store

@@ -1,7 +1,6 @@
 # AGENTS.md
 
 ## Dev environment tips
-- **Operating System:** This host is Windows. Always use **PowerShell commands** for terminal operations.
 - **External APIs:** Always use web search when you are unsure about how to use any external API integrated into this project.
 
 ## Code style & conventions
