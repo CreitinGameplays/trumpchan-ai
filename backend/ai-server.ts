@@ -26,6 +26,46 @@ if (!existsSync(MEMORY_DIR)) {
 let session: Session | undefined = undefined;
 let aiWsClient: WebSocket | undefined = undefined;
 
+// Latest session resumption handle, used to reconnect transparently when the
+// Live API periodically resets the underlying WebSocket (~every 10 min) or
+// throws a 1011 "internal error" (a known native-audio preview instability).
+let sessionResumptionHandle: string | undefined = undefined;
+
+// True only while the Gemini Live session is connected and safe to send to.
+// Guards every outbound send so we never push into a dead/closing socket.
+let geminiReady = false;
+// Prevents overlapping reconnect attempts.
+let reconnecting = false;
+// Reconnect backoff state.
+let reconnectAttempts = 0;
+const MAX_RECONNECT_DELAY_MS = 15000;
+// Timestamp of the last successful onopen. Used to tell a healthy long-lived
+// session (whose backoff should reset) apart from a connect->immediately-die
+// loop (whose backoff must keep growing).
+let lastConnectedAt = 0;
+// A session must stay open at least this long before we consider it "stable"
+// and reset the backoff counter.
+const STABLE_SESSION_MS = 15000;
+
+// Vision circuit breaker. If the session dies repeatedly and quickly AND the
+// closes are NOT the 1007/handle protocol error (which we fix by reconnecting
+// fresh), video is the likely trigger, so we disable vision forwarding to keep
+// audio/text alive. 1007 closes are excluded because they are a resumption-
+// handle/context problem, not a video-rejection problem.
+let visionEnabled = true;
+let recentCloseTimestamps: number[] = [];
+const CLOSE_BURST_WINDOW_MS = 60000; // look at closes within the last minute
+const CLOSE_BURST_THRESHOLD = 4;     // this many rapid closes trips the breaker
+
+// Reusable connection config builder (needs the AI client + system prompt).
+let geminiClient: GoogleGenAI | undefined = undefined;
+let geminiModel = '';
+let geminiSysInstruction = '';
+
+// Lightweight throttle + logging counters for the incoming vision stream.
+let lastVisionFrameAt = 0;
+let visionFrameCount = 0;
+
 // VRM native expression presets the avatar can display in real time.
 // These map 1:1 to @pixiv/three-vrm VRMExpressionPresetName emotion presets.
 const VALID_EMOTIONS = ['neutral', 'happy', 'angry', 'sad', 'relaxed', 'surprised'] as const;
@@ -69,9 +109,8 @@ const aiTools = [
                             type: Type.NUMBER,
                             description:
                                 "Required. Duration in seconds to hold the expression before it automatically eases " +
-                                "back to the neutral resting face. Use a short value for brief reactions (e.g. 2 for a " +
-                                "quick surprised gasp) and a larger value to sustain a mood. Set to 0 to hold the " +
-                                "expression indefinitely until you change it again.",
+                                "back to the neutral resting face. Must be greater than 0. Use a short value for brief " +
+                                "reactions (e.g. 2 for a quick surprised gasp) and a larger value to sustain a mood.",
                         },
                     },
                 },
@@ -115,19 +154,10 @@ async function saveHistory(history: any[]) {
     }
 }
 
-async function startAiServer() {
-    console.log("Starting Gemini Live AI WebSocket Proxy...");
-    const ai = new GoogleGenAI({ apiKey: geminiapiKey });
-    const model = 'models/gemini-2.5-flash-native-audio-preview-12-2025';
-
-    let sysInstruction = "You are a friendly VTuber named Trumpchan. Keep your responses engaging, short, and conversational.";
-    try {
-        sysInstruction = await fs.readFile('./SYSTEM.txt', 'utf-8');
-    } catch (e) {
-        console.log("SYSTEM.txt not found, using default instructions.");
-    }
-
-    const config: any = {
+// Build the Live API session config. Rebuilt on every (re)connect so it can
+// pick up the latest session resumption handle.
+function buildLiveConfig(): any {
+    return {
         responseModalities: [Modality.AUDIO],
         outputAudioTranscription: {},
         inputAudioTranscription: {},
@@ -146,26 +176,150 @@ async function startAiServer() {
             }
         },
         systemInstruction: {
-            parts: [{ text: sysInstruction }]
+            parts: [{ text: geminiSysInstruction }]
         },
         tools: aiTools,
+        // Vision is always on: the frontend streams ~1 FPS video frames of the
+        // whole scene (avatar + floating browser). Audio+video sessions are
+        // capped at 2 minutes WITHOUT compression, so we MUST enable context
+        // window compression (sliding window) to keep the session alive.
+        contextWindowCompression: {
+            triggerTokens: '16000',
+            slidingWindow: { targetTokens: '4000' },
+        },
+        // The Live connection resets roughly every 10 minutes and the native-audio
+        // preview model also throws intermittent 1011 "internal errors". Session
+        // resumption lets us reconnect and continue the same conversation.
+        // Passing a stored handle (if any) resumes the previous session.
+        sessionResumption: sessionResumptionHandle
+            ? { handle: sessionResumptionHandle }
+            : {},
     };
+}
+
+// (Re)connect the Gemini Live session. Safe to call repeatedly; it tears down
+// any previous session and gates sends via `geminiReady` until connected.
+async function connectGemini(): Promise<boolean> {
+    if (!geminiClient) {
+        console.error('[GEMINI] connectGemini called before client init.');
+        return false;
+    }
+
+    geminiReady = false;
+
+    // Best-effort close of any prior session so we don't leak sockets.
+    if (session) {
+        try { session.close(); } catch { /* ignore */ }
+        session = undefined;
+    }
 
     try {
-        session = await ai.live.connect({
-            model,
-            config,
+        session = await geminiClient.live.connect({
+            model: geminiModel,
+            config: buildLiveConfig(),
             callbacks: {
-                onopen: () => console.log('Gemini Live API: Connected successfully!'),
+                onopen: () => {
+                    geminiReady = true;
+                    lastConnectedAt = Date.now();
+                    console.log(
+                        sessionResumptionHandle
+                            ? 'Gemini Live API: Reconnected (resumed session).'
+                            : 'Gemini Live API: Connected successfully!'
+                    );
+                },
                 onmessage: (msg: LiveServerMessage) => handleModelTurn(msg),
-                onerror: (e) => console.error('Gemini Live API Error:', e),
-                onclose: (e) => console.log('Gemini Live API Closed:', e)
+                onerror: (e) => console.error('Gemini Live API Error:', (e as any)?.message ?? e),
+                onclose: (e: any) => {
+                    geminiReady = false;
+                    const code = Number(e?.code ?? e?.[Symbol.for('kCode')] ?? 0);
+                    const reason = e?.reason ?? e?.[Symbol.for('kReason')] ?? '';
+
+                    // Only reset the backoff counter if the session actually stayed
+                    // up for a while. A connect->immediately-die loop must keep
+                    // backing off instead of hammering the API.
+                    const wasStable = lastConnectedAt > 0 && (Date.now() - lastConnectedAt) > STABLE_SESSION_MS;
+                    if (wasStable) reconnectAttempts = 0;
+
+                    // 1007 "invalid argument" on gemini-3.1-flash-live-preview is a
+                    // known resumption-handle/context problem: retrying with the SAME
+                    // handle reproduces it forever. Drop the handle and reconnect
+                    // fresh. This is NOT a video-rejection, so don't count it toward
+                    // the vision circuit breaker.
+                    if (code === 1007) {
+                        console.warn(`Gemini Live API Closed (code 1007): ${reason}. Dropping stale resumption handle and reconnecting fresh.`);
+                        sessionResumptionHandle = undefined;
+                    } else {
+                        console.warn(`Gemini Live API Closed (code ${code}): ${reason}. Scheduling reconnect...`);
+                        trackCloseForBreaker();
+                    }
+                    scheduleGeminiReconnect();
+                },
             }
         });
+        return true;
     } catch (error) {
-        console.error("Failed to connect to Gemini API:", error);
-        return;
+        console.error('[GEMINI] Failed to connect:', error);
+        geminiReady = false;
+        scheduleGeminiReconnect();
+        return false;
     }
+}
+
+// Track non-1007 connection closes; if they burst while vision is on, trip the
+// breaker and stop forwarding video so the (otherwise stable) audio/text
+// session can stay up. This isolates whether the video stream is what the model
+// rejects. 1007/handle errors are handled separately and never reach here.
+function trackCloseForBreaker() {
+    if (!visionEnabled) return; // already tripped; nothing to isolate
+    const now = Date.now();
+    recentCloseTimestamps.push(now);
+    recentCloseTimestamps = recentCloseTimestamps.filter(t => now - t < CLOSE_BURST_WINDOW_MS);
+
+    if (recentCloseTimestamps.length >= CLOSE_BURST_THRESHOLD) {
+        visionEnabled = false;
+        recentCloseTimestamps = [];
+        console.error(
+            `[VISION] Circuit breaker tripped: ${CLOSE_BURST_THRESHOLD} rapid session closes ` +
+            `while streaming video. Disabling vision forwarding to keep audio/text alive. ` +
+            `Restart the AI server to re-enable vision.`
+        );
+    }
+}
+
+// Reconnect with exponential backoff. Reuses the stored resumption handle so
+// the conversation context survives the drop.
+function scheduleGeminiReconnect() {
+    if (reconnecting) return;
+    reconnecting = true;
+
+    const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), MAX_RECONNECT_DELAY_MS);
+    reconnectAttempts++;
+    console.log(`[GEMINI] Reconnecting in ${delay}ms (attempt ${reconnectAttempts}, handle ${sessionResumptionHandle ? 'present' : 'none'}).`);
+
+    setTimeout(async () => {
+        reconnecting = false;
+        await connectGemini();
+    }, delay);
+}
+
+async function startAiServer() {
+    console.log("Starting Gemini Live AI WebSocket Proxy...");
+    const ai = new GoogleGenAI({ apiKey: geminiapiKey });
+    const model = 'models/gemini-3.1-flash-live-preview';
+
+    let sysInstruction = "You are a friendly VTuber named Trumpchan. Keep your responses engaging, short, and conversational.";
+    try {
+        sysInstruction = await fs.readFile('./SYSTEM.txt', 'utf-8');
+    } catch (e) {
+        console.log("SYSTEM.txt not found, using default instructions.");
+    }
+
+    // Stash the pieces needed to (re)build a session so reconnects can reuse them.
+    geminiClient = ai;
+    geminiModel = model;
+    geminiSysInstruction = sysInstruction;
+
+    await connectGemini();
 
     // Connect to the localized Main Server (Visualizer WS Server)
     aiWsClient = new WebSocket('ws://localhost:3000');
@@ -182,7 +336,11 @@ async function startAiServer() {
             const cmd = JSON.parse(data.toString());
 
             // Only process incoming user chat messages
-            if (cmd.type === 'chatMessage' && cmd.text && session) {
+            if (cmd.type === 'chatMessage' && cmd.text) {
+                if (!geminiReady || !session) {
+                    console.warn('[USER] Dropped chat message: Gemini session not ready.');
+                    return;
+                }
                 console.log(`[USER]: ${cmd.text}`);
 
                 // Reset caption for a new turn
@@ -196,11 +354,57 @@ async function startAiServer() {
                 history.push({ role: 'user', text: cmd.text, timestamp: new Date().toISOString() });
                 await saveHistory(history);
 
-                // Queue to Gemini Live
-                session.sendClientContent({
-                    turns: [cmd.text]
-                });
+                // Queue to Gemini Live. On the Gemini 3.x Live models,
+                // sendClientContent is only for seeding initial history;
+                // mid-conversation text must be sent via sendRealtimeInput.
+                try {
+                    session.sendRealtimeInput({ text: cmd.text });
+                } catch (e) {
+                    console.error('[USER] Failed to send chat to Gemini:', e);
+                }
             }
+
+            // Live vision frames from the Electron capture loop. Each frame is
+            // the full composited window (3D avatar + the floating browser and
+            // whatever page it shows), so the model can actually SEE the scene.
+            else if (cmd.type === 'visionFrame' && cmd.data) {
+                // Silently drop frames while the session is down/reconnecting -
+                // sending into a closed session is what killed the socket before.
+                if (!geminiReady || !session) return;
+                // Respect the circuit breaker: if vision was disabled after a
+                // burst of failures, stop forwarding frames entirely.
+                if (!visionEnabled) return;
+
+                const now = Date.now();
+                // Safety throttle: never forward faster than ~1 FPS even if the
+                // client bursts frames (the Live API only accepts ~1 FPS video).
+                if (now - lastVisionFrameAt < 900) {
+                    return;
+                }
+                lastVisionFrameAt = now;
+                visionFrameCount++;
+
+                try {
+                    session.sendRealtimeInput({
+                        video: {
+                            data: cmd.data,
+                            mimeType: cmd.mimeType || 'image/jpeg',
+                        },
+                    });
+                    // Log sparingly so we don't spam the console every second.
+                    if (visionFrameCount === 1 || visionFrameCount % 15 === 0) {
+                        console.log(`[VISION] Forwarded frame #${visionFrameCount} to Gemini (${cmd.width}x${cmd.height}).`);
+                    }
+                } catch (e) {
+                    console.error('[VISION] Failed to forward frame to Gemini:', e);
+                }
+            }
+
+            // NOTE: Browser interactions (page loads / navigation) must NOT
+            // trigger the AI. We deliberately do not accept any grounding-text
+            // message here, so loading a webpage never provokes a response. The
+            // AI still passively sees the page via the vision frames above and
+            // only reacts when the user actually speaks/types.
         } catch (e) {
             console.error('Error handling WS command from main Server', e);
         }
@@ -228,9 +432,11 @@ function handleToolCalls(functionCalls: any[]) {
             intensity = Math.max(0, Math.min(1, intensity));
 
             // Duration in seconds to hold before auto-reverting to neutral.
-            // 0 (or omitted/invalid) means hold indefinitely.
+            // Must be greater than 0; if omitted/invalid/<=0, fall back to a
+            // sensible default so the expression always eases back on its own.
+            const DEFAULT_EMOTION_DURATION = 2;
             let duration = Number(functionCall.args?.duration);
-            if (!Number.isFinite(duration) || duration < 0) duration = 0;
+            if (!Number.isFinite(duration) || duration <= 0) duration = DEFAULT_EMOTION_DURATION;
 
             if (rawEmotion !== emotion) {
                 console.warn(`[AI-TOOL] Unknown emotion "${rawEmotion}", falling back to "neutral".`);
@@ -270,6 +476,13 @@ function handleToolCalls(functionCalls: any[]) {
 }
 
 async function handleModelTurn(message: LiveServerMessage) {
+    // Track the latest session resumption handle so we could reconnect
+    // transparently after the Live API resets the connection (~10 min).
+    if (message.sessionResumptionUpdate?.resumable && message.sessionResumptionUpdate.newHandle) {
+        sessionResumptionHandle = message.sessionResumptionUpdate.newHandle;
+        console.log('[SESSION] Stored new resumption handle.');
+    }
+
     // Handle function/tool calls from the model (e.g. set_emotion).
     // These arrive on message.toolCall, separate from the audio stream.
     if (message.toolCall?.functionCalls?.length) {

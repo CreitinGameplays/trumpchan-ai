@@ -182,10 +182,13 @@ export function createBrowserWindow(scene, {
         canGoBack: viewEl.canGoBack?.() ?? false,
         canGoForward: viewEl.canGoForward?.() ?? false,
       });
+      // Intentionally does NOT notify the AI. Browser navigation is silent so
+      // that loading a page never triggers an AI response.
     };
     viewEl.addEventListener('did-navigate', syncUrl);
     viewEl.addEventListener('did-navigate-in-page', syncUrl);
     viewEl.addEventListener('did-finish-load', syncUrl);
+    viewEl.addEventListener('page-title-updated', syncUrl);
   }
 
   function dispose() {

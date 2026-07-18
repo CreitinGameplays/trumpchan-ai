@@ -92,6 +92,10 @@ grid.position.y = 0;
 scene.add(grid);
 
 // Floating, interactive browser window inside the 3D scene (test).
+// NOTE: Browser interactions (loading pages, navigating) intentionally do NOT
+// notify the AI. We don't send any navigation/grounding text, so loading a
+// webpage never triggers an AI response. The AI still passively SEES the page
+// through the always-on vision frames, but only reacts when the user speaks.
 const browserWindow = createBrowserWindow(scene, {
   url: 'https://example.com',
   position: new THREE.Vector3(1.7, 1.5, -0.3),
