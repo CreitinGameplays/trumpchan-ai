@@ -135,7 +135,7 @@ async function startAiServer() {
         // briefly reason (e.g. pick the right emotion / tool call) without adding
         // noticeable latency to the live audio. Set to 0 to fully disable.
         thinkingConfig: {
-            thinkingBudget: 512
+            thinkingBudget: 0 // setting this to a higher value cause a bug in the model that makes it output "<ctrl46><ctrl46>" every turn.
         },
         mediaResolution: MediaResolution.MEDIA_RESOLUTION_MEDIUM,
         speechConfig: {
