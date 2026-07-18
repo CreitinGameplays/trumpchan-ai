@@ -1,4 +1,4 @@
-import { GoogleGenAI, LiveServerMessage, Modality, MediaResolution, Session } from '@google/genai';
+import { GoogleGenAI, LiveServerMessage, Modality, MediaResolution, Session, Type, Behavior, FunctionResponseScheduling } from '@google/genai';
 import * as fs from 'fs/promises';
 import { existsSync, mkdirSync } from 'fs';
 import * as path from 'path';
@@ -25,6 +25,60 @@ if (!existsSync(MEMORY_DIR)) {
 
 let session: Session | undefined = undefined;
 let aiWsClient: WebSocket | undefined = undefined;
+
+// VRM native expression presets the avatar can display in real time.
+// These map 1:1 to @pixiv/three-vrm VRMExpressionPresetName emotion presets.
+const VALID_EMOTIONS = ['neutral', 'happy', 'angry', 'sad', 'relaxed', 'surprised'] as const;
+
+// Function-call tools exposed to the model. We use NON_BLOCKING behaviour so the
+// emote calls never pause/interrupt the audio (TTS) generation. Parsing emotes
+// out of the spoken text would break the TTS, so we rely on tool calls instead.
+const aiTools = [
+    {
+        functionDeclarations: [
+            {
+                name: 'set_emotion',
+                description:
+                    "Set the avatar's facial expression in real time to match the emotional tone of what you are currently saying. " +
+                    "Call this the instant your mood shifts (e.g. right before saying something cheerful, sad, angry, shocked, or calm). " +
+                    "You can call it multiple times within a single reply as your tone changes. This only changes the face; it does not speak.",
+                behavior: Behavior.NON_BLOCKING,
+                parameters: {
+                    type: Type.OBJECT,
+                    required: ['emotion', 'duration'],
+                    properties: {
+                        emotion: {
+                            type: Type.STRING,
+                            enum: [...VALID_EMOTIONS],
+                            description:
+                                "The emotion preset to display: " +
+                                "'happy' (joy, smiling, excited, playful), " +
+                                "'sad' (sorrow, disappointed, sympathetic), " +
+                                "'angry' (annoyed, frustrated, mock-pouting), " +
+                                "'surprised' (shocked, amazed, caught off guard), " +
+                                "'relaxed' (calm, cozy, content, soothing), " +
+                                "'neutral' (reset back to a natural resting face).",
+                        },
+                        intensity: {
+                            type: Type.NUMBER,
+                            description:
+                                "Optional strength of the expression from 0.0 to 1.0. Defaults to 1.0 (full). " +
+                                "Use a lower value (e.g. 0.5) for a subtle expression.",
+                        },
+                        duration: {
+                            type: Type.NUMBER,
+                            description:
+                                "Required. Duration in seconds to hold the expression before it automatically eases " +
+                                "back to the neutral resting face. Use a short value for brief reactions (e.g. 2 for a " +
+                                "quick surprised gasp) and a larger value to sustain a mood. Set to 0 to hold the " +
+                                "expression indefinitely until you change it again.",
+                        },
+                    },
+                },
+            },
+        ],
+    },
+];
 
 const responseQueue: LiveServerMessage[] = [];
 let currentGlobalCaption = "";
@@ -77,8 +131,11 @@ async function startAiServer() {
         responseModalities: [Modality.AUDIO],
         outputAudioTranscription: {},
         inputAudioTranscription: {},
+        // Low thinking mode: give the model a small reasoning budget so it can
+        // briefly reason (e.g. pick the right emotion / tool call) without adding
+        // noticeable latency to the live audio. Set to 0 to fully disable.
         thinkingConfig: {
-            thinkingBudget: 0
+            thinkingBudget: 512
         },
         mediaResolution: MediaResolution.MEDIA_RESOLUTION_MEDIUM,
         speechConfig: {
@@ -91,6 +148,7 @@ async function startAiServer() {
         systemInstruction: {
             parts: [{ text: sysInstruction }]
         },
+        tools: aiTools,
     };
 
     try {
@@ -154,7 +212,71 @@ async function startAiServer() {
     });
 }
 
+function handleToolCalls(functionCalls: any[]) {
+    const functionResponses = functionCalls.map((functionCall) => {
+        console.log(`[AI-TOOL] ${functionCall.name} args:`, JSON.stringify(functionCall.args));
+
+        if (functionCall.name === 'set_emotion') {
+            const rawEmotion = String(functionCall.args?.emotion ?? '').toLowerCase().trim();
+            const emotion = (VALID_EMOTIONS as readonly string[]).includes(rawEmotion)
+                ? rawEmotion
+                : 'neutral';
+
+            // Clamp intensity to [0, 1], default to full expression.
+            let intensity = Number(functionCall.args?.intensity);
+            if (!Number.isFinite(intensity)) intensity = 1.0;
+            intensity = Math.max(0, Math.min(1, intensity));
+
+            // Duration in seconds to hold before auto-reverting to neutral.
+            // 0 (or omitted/invalid) means hold indefinitely.
+            let duration = Number(functionCall.args?.duration);
+            if (!Number.isFinite(duration) || duration < 0) duration = 0;
+
+            if (rawEmotion !== emotion) {
+                console.warn(`[AI-TOOL] Unknown emotion "${rawEmotion}", falling back to "neutral".`);
+            }
+
+            // Forward the emotion to the frontend visualizer over WebSocket.
+            if (aiWsClient && aiWsClient.readyState === WebSocket.OPEN) {
+                aiWsClient.send(JSON.stringify({
+                    type: 'emotion',
+                    emotion,
+                    intensity,
+                    duration,
+                }));
+                console.log(`[AI-TOOL] Sent emotion "${emotion}" (intensity ${intensity}, duration ${duration}s) to visualizer.`);
+            } else {
+                console.warn('[AI-TOOL] Visualizer WS not connected; emotion not delivered.');
+            }
+        } else {
+            console.warn(`[AI-TOOL] Received unknown tool call: ${functionCall.name}`);
+        }
+
+        // Respond SILENT so the tool result never triggers extra model output
+        // and never interrupts the ongoing audio (TTS) stream.
+        return {
+            id: functionCall.id,
+            name: functionCall.name,
+            response: { result: 'ok' },
+            scheduling: FunctionResponseScheduling.SILENT,
+        };
+    });
+
+    try {
+        session?.sendToolResponse({ functionResponses });
+    } catch (e) {
+        console.error('[AI-TOOL] Failed to send tool response:', e);
+    }
+}
+
 async function handleModelTurn(message: LiveServerMessage) {
+    // Handle function/tool calls from the model (e.g. set_emotion).
+    // These arrive on message.toolCall, separate from the audio stream.
+    if (message.toolCall?.functionCalls?.length) {
+        handleToolCalls(message.toolCall.functionCalls);
+        return;
+    }
+
     const sc = message.serverContent as any;
 
     // Handle audio chunks from modelTurn

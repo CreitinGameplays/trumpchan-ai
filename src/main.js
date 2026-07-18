@@ -112,6 +112,98 @@ let blinkState = createBlinkState();
 let gazeState = createNaturalGazeState();
 let headIdleRig = null;
 let headIdleState = createHeadIdleState();
+
+// Native VRM emotion presets the AI can drive via function calls.
+// These are blended smoothly each frame so the face eases between moods
+// instead of snapping. Lip-sync (aa/ee/ih/oh/ou) and blink are handled
+// separately, so emotion expressions never fight with mouth/eye animation.
+const EMOTION_EXPRESSIONS = ['happy', 'angry', 'sad', 'relaxed', 'surprised', 'neutral'];
+const EMOTION_BLEND_SPEED = 6; // higher = snappier transition
+const emotionState = {
+  // Target weight for each emotion expression (what the AI requested).
+  target: { happy: 0, angry: 0, sad: 0, relaxed: 0, surprised: 0, neutral: 0 },
+  // Current interpolated weight actually applied to the VRM each frame.
+  current: { happy: 0, angry: 0, sad: 0, relaxed: 0, surprised: 0, neutral: 0 },
+  // Seconds left before auto-reverting to neutral. <= 0 means hold forever.
+  holdRemaining: 0
+};
+
+function setEmotion(emotion, intensity = 1.0, duration = 0) {
+  const name = String(emotion || '').toLowerCase().trim();
+  if (!EMOTION_EXPRESSIONS.includes(name)) {
+    console.warn(`[Emotion] Ignoring unknown emotion "${emotion}"`);
+    return;
+  }
+
+  const value = Math.max(0, Math.min(1, Number.isFinite(intensity) ? intensity : 1.0));
+
+  // Only one emotion is active at a time: zero out the others as targets so
+  // the current expression eases out while the new one eases in.
+  for (const key of EMOTION_EXPRESSIONS) {
+    emotionState.target[key] = 0;
+  }
+
+  // 'neutral' means "no emotional overlay" — leave every target at 0.
+  if (name !== 'neutral') {
+    emotionState.target[name] = value;
+  }
+
+  // Optional auto-revert timer. duration <= 0 (or neutral) holds indefinitely.
+  const holdSeconds = Number.isFinite(duration) ? duration : 0;
+  emotionState.holdRemaining = name !== 'neutral' && holdSeconds > 0 ? holdSeconds : 0;
+
+  console.log(
+    `[Emotion] Target set to "${name}" @ ${value}` +
+    (emotionState.holdRemaining > 0 ? ` for ${emotionState.holdRemaining}s` : ' (held until changed)')
+  );
+}
+
+// Clear all emotion weights instantly (used when (re)loading a model).
+function resetEmotions() {
+  for (const key of EMOTION_EXPRESSIONS) {
+    emotionState.target[key] = 0;
+    emotionState.current[key] = 0;
+  }
+  emotionState.holdRemaining = 0;
+}
+
+// Whether the loaded VRM actually has a given emotion expression preset.
+function hasEmotionExpression(name) {
+  return currentVrm?.expressionManager?.getExpression?.(name) != null;
+}
+
+// Smoothly move current emotion weights toward their targets and apply them.
+function updateEmotions(delta) {
+  const manager = currentVrm?.expressionManager;
+  if (!manager) return;
+
+  // Count down the hold timer; when it expires, ease back to neutral.
+  if (emotionState.holdRemaining > 0) {
+    emotionState.holdRemaining -= delta;
+    if (emotionState.holdRemaining <= 0) {
+      emotionState.holdRemaining = 0;
+      for (const key of EMOTION_EXPRESSIONS) {
+        emotionState.target[key] = 0;
+      }
+      console.log('[Emotion] Hold expired, reverting to neutral.');
+    }
+  }
+
+  const t = Math.min(1, EMOTION_BLEND_SPEED * delta);
+
+  for (const name of EMOTION_EXPRESSIONS) {
+    if (name === 'neutral') continue; // neutral is not a driven blendshape
+
+    const cur = emotionState.current[name];
+    const next = cur + (emotionState.target[name] - cur) * t;
+    emotionState.current[name] = next;
+
+    if (hasEmotionExpression(name)) {
+      manager.setValue(name, next);
+    }
+  }
+}
+
 const gazeOrigin = new THREE.Vector3();
 const gazeCameraForward = new THREE.Vector3();
 const gazeCameraRight = new THREE.Vector3();
@@ -675,6 +767,7 @@ async function loadVrm(url, label = 'default VRM') {
 
     VRMUtils.rotateVRM0(vrm);
     currentVrm = vrm;
+    resetEmotions();
     headIdleRig = setupHeadIdleRig(vrm);
     resetNaturalGazeState();
     currentAvatarRoot = new THREE.Group();
@@ -746,6 +839,7 @@ function animate() {
   updateNaturalGaze(delta);
   updateBlink(delta);
   updateLipSync(); // Added AI lip sync driven by Web Audio Analyser RMS volume
+  updateEmotions(delta); // AI-driven native VRM emotion blending (happy/angry/sad/etc.)
   currentVrm?.update(delta);
 
   renderer.render(scene, camera);
@@ -912,6 +1006,12 @@ function handleApiCommand(cmd) {
       if (currentVrm && currentVrm.expressionManager) {
         currentVrm.expressionManager.setValue(cmd.expression, cmd.value);
       }
+      break;
+    case 'emotion':
+      // AI-driven native VRM emotion (via Gemini function call). Smoothly
+      // blended in updateEmotions() so it never snaps or fights lip-sync.
+      console.log(`[WS] Received emotion command:`, cmd.emotion, cmd.intensity, cmd.duration);
+      setEmotion(cmd.emotion, cmd.intensity, cmd.duration);
       break;
     case 'lookAt':
       if (cmd.target && currentVrm && currentVrm.lookAt) {
