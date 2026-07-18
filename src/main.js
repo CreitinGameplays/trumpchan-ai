@@ -5,6 +5,7 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
 import { loadMixamoAnimation } from './loadMixamoAnimation.js';
+import { createBrowserWindow } from './browserWindow.js';
 import defaultVrmUrl from '../files/Pati.vrm?url';
 import defaultAnimationUrl from '../files/Standing-Idle.fbx?url';
 
@@ -89,6 +90,13 @@ scene.add(floor);
 const grid = new THREE.GridHelper(10, 20, '#718690', '#9bb0ba');
 grid.position.y = 0;
 scene.add(grid);
+
+// Floating, interactive browser window inside the 3D scene (test).
+const browserWindow = createBrowserWindow(scene, {
+  url: 'https://example.com',
+  position: new THREE.Vector3(1.7, 1.5, -0.3),
+  rotation: new THREE.Euler(0, -0.5, 0),
+});
 
 const loader = new GLTFLoader();
 loader.register((parser) => new VRMLoaderPlugin(parser));
@@ -566,6 +574,7 @@ function resizeRenderer() {
     renderer.setSize(width, height, false);
     camera.aspect = width / height;
     camera.updateProjectionMatrix();
+    browserWindow.setSize(width, height);
   }
 }
 
@@ -740,6 +749,7 @@ function animate() {
   currentVrm?.update(delta);
 
   renderer.render(scene, camera);
+  browserWindow.render(camera);
 }
 
 async function initializeViewer() {
