@@ -82,7 +82,7 @@ Loads an entirely new VRM model into the scene.
 
 ### 4. Load Animation
 
-Loads a new Mixamo `.fbx` animation for the model.
+Sets the **base (idle) layer** Mixamo `.fbx` animation for the model. The base layer is what plays while the avatar is *not* speaking (idle, walking, dancing, etc.). It cross-fades in over the current base and never snaps.
 
 **Request Body:**
 ```json
@@ -93,6 +93,8 @@ Loads a new Mixamo `.fbx` animation for the model.
 ```
 - `url` (String): URL resolving to a valid Mixamo `.fbx` animation file.
 
+> The co-speech **talking gesture layer** is separate and automatic (see [Talking Gestures](#talking-gestures)); it plays on top of the base layer whenever the AI is speaking and does not need an API call.
+
 ### 5. Reset Position
 
 Resets the model's position back to the origin, which is useful if the model has drifted due to walking/root-motion animations.
@@ -102,6 +104,48 @@ Resets the model's position back to the origin, which is useful if the model has
 {
   "type": "resetPosition"
 }
+```
+
+---
+
+## Talking Gestures
+
+Co-speech hand/body gestures are handled automatically on the frontend (`src/gestureSystem.js`) — no API calls required. Motion is **generated at runtime from a library of target keyposes**, blended in time with the avatar's speech, rather than replayed from pre-made talking clips. Pre-made clips animate the arms *constantly* (excessive on simple replies); this approach lets gesture density **emerge from the speech**, so a calm reply gets a couple of sparse gestures while an animated, loud passage gestures more.
+
+This mirrors how real co-speech-motion systems are structured (e.g. the "plan-then-infill" split of semantic keyposes + prosody-driven timing): pick a *readable pose*, then time it to the voice.
+
+### How it works
+
+- A `GestureController` owns a single `AnimationMixer` for the **base layer** (the persistent idle/walk/etc. clip set via [Load Animation](#4-load-animation)) and applies an **additive gesture layer** on top.
+- **Keypose library** (`POSES`): each entry is a real, readable gesture — `raiseHand`, `openPalmOut`, `pointUp`, `toChest`, `chopDown`, `shrug`, `bigSpread`, `relaxedTalk` — authored as target joint angles for the right side (auto-mirrored to the left). Poses include a **hand shape** (`open` / `relaxed` / `point`) that curls the finger bones.
+- **Gesture envelope**: while speaking, the controller picks a pose and plays it through **attack → hold → release** (ease-in with slight overshoot, brief sustain, ease-out back to idle). A **rest gap** follows before the next gesture; the gap length is set by energy tier, so low energy leaves the arms mostly at rest.
+- **Accent beats**: **loudness onsets** (rising edges in the speech envelope = emphasis) fire small spring-driven elbow/wrist flicks *on top of* the held pose, so a sustained gesture stays alive and syncs to vocal stress.
+- **Sway**: a tiny continuous sway keeps a held pose breathing rather than frozen.
+- **Speech detection** comes from the audio playback schedule (the frontend knows when queued PCM is still playing). On speech start the layer eases in; on speech end the active gesture releases and the layer eases out to the pure idle pose.
+- **Mood coupling**: the current emotion (from [Set Emotion](#1b-set-emotion-ai-driven)) selects an energy **tier** (`angry`/`happy`/`surprised` → high, `sad`/`relaxed` → low) that biases pose selection, hold length, rest gaps, and two-hand chance. Smoothed speech loudness shortens gaps and scales accents.
+- All offsets are composed on top of whatever pose the base clip produces using the same post-multiply technique as the head-idle layer, on the VRM **normalized** humanoid bones (T-pose = identity), so poses are model-independent and never fight the base animation or snap to a T-pose.
+
+### Tuning
+
+Everything is driven by named constants / tables at the top of `src/gestureSystem.js`:
+- `POSES` — the gesture library. Add a pose by listing its DOFs (`armRaise`, `armOut`, `elbowBend`, `wristPitch`, ...), a `tier`, an optional `twoHand`, and a `fingers` shape.
+- `DOF_AXIS` — maps each DOF to a bone + local axis + per-side sign. **If a joint bends the wrong way on your rig, flip its sign here** (one line).
+- `ATTACK_RANGE` / `HOLD_RANGE` / `RELEASE_RANGE` / `GAP_BY_TIER` — gesture timing and how sparse each tier is.
+- `FINGER_SHAPES` / `FINGER_CURL_AXIS` / `FINGER_CURL_SIGN` — hand shapes; flip the axis/sign if fingers splay outward instead of curling.
+- `ONSET_DELTA_THRESHOLD` / `ACCENT_KICK` — emphasis sensitivity and accent strength.
+
+No animation assets are required for gestures; the `files/talking_animations/` clips are no longer used.
+
+## Outgoing Messages (server → frontend)
+
+Beyond `audio`, `caption`, and `emotion`, the server emits:
+
+### `interrupted`
+
+Sent when the Gemini Live API reports the user barged in over the model (`serverContent.interrupted`). The frontend drops any queued audio and fast-settles the avatar's body back to idle so a half-finished gesture never freezes mid-air.
+
+```json
+{ "type": "interrupted" }
 ```
 
 ---

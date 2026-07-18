@@ -492,6 +492,18 @@ async function handleModelTurn(message: LiveServerMessage) {
 
     const sc = message.serverContent as any;
 
+    // Barge-in: the Live API sets `interrupted` when the user speaks over the
+    // model. Tell the frontend to drop any queued audio and settle the avatar
+    // back to idle so a half-finished gesture doesn't freeze mid-air.
+    if (sc?.interrupted === true) {
+        console.log('[AI] Turn interrupted by user; signalling frontend to stop.');
+        voiceChanger.reset();
+        if (aiWsClient && aiWsClient.readyState === WebSocket.OPEN) {
+            aiWsClient.send(JSON.stringify({ type: 'interrupted' }));
+        }
+        return;
+    }
+
     // Handle audio chunks from modelTurn
     if (sc?.modelTurn?.parts) {
         for (const part of sc.modelTurn.parts) {

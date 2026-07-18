@@ -5,6 +5,7 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
 import { loadMixamoAnimation } from './loadMixamoAnimation.js';
+import { GestureController } from './gestureSystem.js';
 import { createBrowserWindow } from './browserWindow.js';
 import defaultVrmUrl from '../files/Pati.vrm?url';
 import defaultAnimationUrl from '../files/Standing-Idle.fbx?url';
@@ -107,11 +108,16 @@ loader.register((parser) => new VRMLoaderPlugin(parser));
 
 let currentVrm = null;
 let currentVrmUrl = null;
-let currentMixer = null;
-let currentAction = null;
+// Owns the AnimationMixer + persistent idle base + talking-gesture layer.
+let gestureController = null;
 let currentAvatarRoot = null;
 let currentMotionRoot = null;
 let currentAnimationSource = null;
+
+// Live speech signals feeding the gesture system:
+//  - speechAmplitude: smoothed 0..1 loudness of the AI's outgoing audio.
+//  - It drives both within-tier motion energy and (with emotion) tier choice.
+let speechAmplitude = 0;
 let blinkState = createBlinkState();
 let gazeState = createNaturalGazeState();
 let headIdleRig = null;
@@ -675,14 +681,9 @@ function resizeRenderer() {
 }
 
 function disposeCurrentModel() {
-  if (currentAction) {
-    currentAction.stop();
-    currentAction = null;
-  }
-
-  if (currentMixer) {
-    currentMixer.stopAllAction();
-    currentMixer = null;
+  if (gestureController) {
+    gestureController.dispose();
+    gestureController = null;
   }
 
   if (!currentVrm) {
@@ -711,16 +712,6 @@ function disposeCurrentModel() {
 }
 
 function disposeCurrentAnimation() {
-  if (currentAction) {
-    currentAction.stop();
-    currentAction = null;
-  }
-
-  if (currentMixer) {
-    currentMixer.stopAllAction();
-    currentMixer = null;
-  }
-
   if (currentAnimationSource?.url?.startsWith('blob:')) {
     URL.revokeObjectURL(currentAnimationSource.url);
   }
@@ -744,10 +735,7 @@ function resetModelPosition() {
 
   currentMotionRoot.position.set(0, 0, 0);
 
-  if (currentAction) {
-    currentAction.reset();
-    currentAction.play();
-  }
+  gestureController?.resetBase();
 
   if (currentVrm) {
     frameModel(currentAvatarRoot ?? currentVrm.scene);
@@ -809,25 +797,63 @@ async function loadAnimation(url, label = 'default animation') {
   }
 
   disposeCurrentAnimation();
-  // setStatus(`Loading animation ${label}...`);
 
   try {
-    const clip = await loadMixamoAnimation(url, currentVrm, {
-      allowVerticalMotion: DEFAULT_ALLOW_VERTICAL_MOTION,
-      allowFloorMotion: DEFAULT_ALLOW_FLOOR_MOTION,
-      rootMotionNodeName: currentMotionRoot?.name ?? null
-    });
-
-    currentMixer = new THREE.AnimationMixer(currentAvatarRoot ?? currentVrm.scene);
-    currentAction = currentMixer.clipAction(clip);
-    currentAction.reset();
-    currentAction.play();
-
-
+    if (!gestureController) {
+      // First animation for this VRM: stand up the gesture system. This loads
+      // the idle base AND preloads the whole talking-gesture pool so speech
+      // gestures can start instantly with zero mid-conversation load latency.
+      gestureController = new GestureController({
+        vrm: currentVrm,
+        root: currentAvatarRoot ?? currentVrm.scene,
+        motionRootName: currentMotionRoot?.name ?? null,
+        getMood: getGestureMood,
+      });
+      await gestureController.load(url);
+    } else {
+      // Subsequent calls (API-driven walk/dance/etc.) swap the persistent base
+      // layer with a cross-fade; the talking layer keeps working on top.
+      await gestureController.setBaseAnimation(url, {
+        allowVerticalMotion: DEFAULT_ALLOW_VERTICAL_MOTION,
+        allowFloorMotion: DEFAULT_ALLOW_FLOOR_MOTION,
+      });
+    }
   } catch (error) {
-    disposeCurrentAnimation();
     setStatus(error instanceof Error ? error.message : 'Failed to load animation.', true);
   }
+}
+
+// Map the avatar's current mood into gesture-selection inputs:
+//  - tierBias: which energy tier of talking clips to prefer.
+//  - amplitude: smoothed speech loudness (0..1) for within-tier liveliness.
+// Emotion sets the baseline tier; loud speech can bump it up a notch.
+function getGestureMood() {
+  let tierBias = 'medium';
+
+  // Strongest active emotion decides the baseline energy.
+  let topEmotion = 'neutral';
+  let topWeight = 0;
+  for (const name of EMOTION_EXPRESSIONS) {
+    if (name === 'neutral') continue;
+    if (emotionState.current[name] > topWeight) {
+      topWeight = emotionState.current[name];
+      topEmotion = name;
+    }
+  }
+
+  if (topWeight > 0.25) {
+    if (topEmotion === 'angry' || topEmotion === 'surprised' || topEmotion === 'happy') {
+      tierBias = 'high';
+    } else if (topEmotion === 'sad' || topEmotion === 'relaxed') {
+      tierBias = 'low';
+    }
+  }
+
+  // Loud, emphatic speech nudges the tier up even on a neutral mood.
+  if (speechAmplitude > 0.6 && tierBias === 'low') tierBias = 'medium';
+  if (speechAmplitude > 0.75 && tierBias === 'medium') tierBias = 'high';
+
+  return { tierBias, amplitude: speechAmplitude };
 }
 
 const clock = new THREE.Clock();
@@ -838,7 +864,8 @@ function animate() {
 
   const delta = clock.getDelta();
   controls.update();
-  currentMixer?.update(delta);
+  updateSpeechState();     // detect AI talking -> drive the gesture layer
+  gestureController?.update(delta);
   updateHeadIdle(delta);
   updateNaturalGaze(delta);
   updateBlink(delta);
@@ -899,6 +926,25 @@ async function playAudioData(base64Pcm) {
   audioStartTime += audioBuffer.duration;
 }
 
+// Derive "is the AI currently talking?" from the audio schedule. `audioStartTime`
+// is the end time of the last queued PCM chunk, so while currentTime hasn't
+// caught up to it, speech is still playing. This is robust across the gaps
+// between words (unlike raw amplitude, which dips mid-sentence). The gesture
+// controller's own tail timer bridges the tiny gaps between streamed chunks.
+function updateSpeechState() {
+  if (!gestureController) return;
+  const talking = !!audioCtx && audioStartTime > audioCtx.currentTime + 0.02;
+  gestureController.setSpeaking(talking);
+}
+
+// Barge-in / interruption: stop scheduled audio and settle the body to idle so
+// a half-finished gesture doesn't freeze mid-air when the user cuts in.
+function stopSpeech() {
+  if (audioCtx) audioStartTime = audioCtx.currentTime;
+  speechAmplitude = 0;
+  gestureController?.settleToIdle(true);
+}
+
 function getEnergy(dataArray, binStart, binEnd) {
   let sum = 0;
   for (let i = binStart; i < binEnd; i++) {
@@ -915,6 +961,11 @@ function updateLipSync() {
     let sum = 0;
     for (let i = 0; i < lipSyncDataArray.length; i++) { sum += lipSyncDataArray[i]; }
     const totalVol = sum / lipSyncDataArray.length;
+
+    // Smoothed 0..1 loudness for the gesture system. ~40 is a loud passage on
+    // this analyser scale; clamp and low-pass so gesture energy doesn't jitter.
+    const instantAmp = Math.max(0, Math.min(1, totalVol / 40));
+    speechAmplitude += (instantAmp - speechAmplitude) * 0.15;
 
     // Reset all facial blendshapes
     currentVrm.expressionManager.setValue('aa', 0);
@@ -998,6 +1049,11 @@ function handleApiCommand(cmd) {
   switch (cmd.type) {
     case 'audio':
       if (cmd.data) playAudioData(cmd.data);
+      break;
+    case 'interrupted':
+      // User barged in: drop queued audio and settle the body to idle fast.
+      console.log('[WS] Turn interrupted; stopping speech + gestures.');
+      stopSpeech();
       break;
     case 'caption':
       if (cmd.text !== undefined) {
