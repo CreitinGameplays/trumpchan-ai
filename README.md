@@ -17,24 +17,22 @@ Simple browser-based AI anime assistant surface for Trumpchan, built with Three.
 - Node.js 18+ recommended
 - ffmpeg
 
-## Install
+On macOS, install ffmpeg with [Homebrew](https://brew.sh):
 
-On Windows PowerShell, use:
-
-```powershell
-npm.cmd install
+```bash
+brew install ffmpeg
 ```
 
-If your shell allows the normal npm command, this also works:
+## Install
 
-```powershell
+```bash
 npm install
 ```
 
 ## Run locally
 
-```powershell
-npm.cmd run dev
+```bash
+npm run dev
 ```
 
 Then open the local URL shown in the terminal, usually:
@@ -69,15 +67,15 @@ http://localhost:5173
 
 ## Build for production
 
-```powershell
-npm.cmd run build
+```bash
+npm run build
 ```
 
 ## `.env` template:
 ```
 GEMINI_API_KEY=api-key-here
 FFMPEG_BINARY=ffmpeg
-VOICE_CHANGER_CONFIG=/path/to/voice-changer-config.json
+VOICE_CHANGER_CONFIG=./voice-changer-config.json
 VOICE_CHANGER_ENABLED=true/false
 ```
 

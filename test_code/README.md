@@ -6,7 +6,7 @@ This directory contains automated test scripts for verifying the functionalities
 
 To run the test scripts, ensure that the API server is currently working. You can start the server in your primary terminal with:
 
-```powershell
+```bash
 npm run dev
 ```
 
@@ -17,7 +17,7 @@ The `vowel-test.ts` script verifies the facial expression API by cycling through
 
 **To run the test:**
 
-```powershell
+```bash
 npx -y tsx test_code/vowel-test.ts
 ```
 

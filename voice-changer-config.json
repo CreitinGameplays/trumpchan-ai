@@ -1,5 +1,5 @@
 {
   "enabled": true,
   "name": "anime-pitch",
-  "ffmpegFilter": "rubberband=pitch=1.05"
+  "ffmpegFilter": "asetrate=25200,atempo=0.952381,aresample=24000"
 }
