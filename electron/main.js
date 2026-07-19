@@ -17,8 +17,10 @@ const isDev = !app.isPackaged;
 const HUB_WS_URL = 'ws://localhost:3000';
 const VISION_FPS = 1; // Gemini Live API caps video input at ~1 frame/sec.
 const VISION_FRAME_INTERVAL_MS = Math.round(1000 / VISION_FPS);
-const VISION_MAX_DIM = 768; // Recommended 768x768 for Live API video frames.
-const VISION_JPEG_QUALITY = 70; // 0-100; balance clarity vs. token/bandwidth cost.
+// Slightly above the classic 768 recommendation so browser text/UI stays
+// readable. Paired with MEDIA_RESOLUTION_HIGH on the AI server.
+const VISION_MAX_DIM = 1024;
+const VISION_JPEG_QUALITY = 88; // 0-100; higher = clearer browser content
 
 function createWindow() {
   console.log('[Electron] Creating main window, isDev:', isDev);
@@ -118,8 +120,7 @@ async function captureAndSend(win) {
     // the <webview> browser content layered on top, exactly as the user sees it.
     let image = await win.webContents.capturePage();
 
-    // Downscale to <=768px on the longest side to match the Live API's
-    // recommended video frame size and keep token/bandwidth cost low.
+    // Downscale to <=VISION_MAX_DIM on the longest side for Live API video.
     const size = image.getSize();
     const longest = Math.max(size.width, size.height);
     if (longest > VISION_MAX_DIM) {
@@ -127,7 +128,7 @@ async function captureAndSend(win) {
       image = image.resize({
         width: Math.round(size.width * scale),
         height: Math.round(size.height * scale),
-        quality: 'good',
+        quality: 'better',
       });
     }
 

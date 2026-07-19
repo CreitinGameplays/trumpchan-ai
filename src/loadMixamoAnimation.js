@@ -119,8 +119,18 @@ function getMixamoBoneInfoFromTrackName(trackName) {
   return null;
 }
 
+// VRM humanoid finger bones all contain one of these tokens. Mixamo->VRM finger
+// retargeting is unreliable (the two skeletons have different finger rest poses,
+// so the retargeted absolute rotation plants the fingers in a fixed twisted /
+// backward pose), and Mixamo idle finger motion is only a couple of degrees
+// anyway. We drop these tracks so fingers stay in the VRM's natural rest pose
+// and the gesture layer can pose them cleanly.
+const FINGER_BONE_TOKENS = ['Thumb', 'Index', 'Middle', 'Ring', 'Little'];
+const isFingerVrmBone = (vrmBoneName) =>
+  !!vrmBoneName && FINGER_BONE_TOKENS.some((token) => vrmBoneName.includes(token));
+
 export async function loadMixamoAnimation(url, vrm, options = {}) {
-  const { allowVerticalMotion = false, allowFloorMotion = false, rootMotionNodeName = null } = options;
+  const { allowVerticalMotion = false, allowFloorMotion = false, rootMotionNodeName = null, excludeFingers = true } = options;
   const loader = new FBXLoader();
   const asset = await loader.loadAsync(url);
   const clip = THREE.AnimationClip.findByName(asset.animations, 'mixamo.com') ?? asset.animations[0];
@@ -153,6 +163,7 @@ export async function loadMixamoAnimation(url, vrm, options = {}) {
     sourceTrackCount: clip.tracks.length,
     mappedTrackCount: 0,
     skippedTrackCount: 0,
+    skippedFingerTrackCount: 0,
     mappedBones: new Set(),
     sampleTracks: clip.tracks.slice(0, 5).map((track) => track.name)
   };
@@ -162,6 +173,13 @@ export async function loadMixamoAnimation(url, vrm, options = {}) {
 
     if (!boneInfo) {
       debugInfo.skippedTrackCount += 1;
+      return;
+    }
+
+    // Skip finger tracks: their retarget is unreliable and leaves fingers
+    // twisted/backward. Fingers are posed by the gesture layer instead.
+    if (excludeFingers && isFingerVrmBone(boneInfo.vrmBoneName)) {
+      debugInfo.skippedFingerTrackCount = (debugInfo.skippedFingerTrackCount ?? 0) + 1;
       return;
     }
 
@@ -276,6 +294,12 @@ export async function loadMixamoAnimation(url, vrm, options = {}) {
     const sampleTracks = clip.tracks.slice(0, 5).map((track) => track.name).join(' | ');
     throw new Error(`No compatible humanoid tracks were found. Sample FBX tracks: ${sampleTracks}`);
   }
+
+  console.log(
+    `[Mixamo] Retargeted ${debugInfo.mappedTrackCount} tracks` +
+    (excludeFingers ? `, dropped ${debugInfo.skippedFingerTrackCount} finger tracks (posed by gesture layer)` : '') +
+    '.'
+  );
 
   if (DEBUG_MIXAMO) {
     console.info('Mixamo debug:', {

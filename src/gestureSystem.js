@@ -31,37 +31,72 @@ const SPEECH_TAIL_SECONDS = 0.28;
 
 // Gesture envelope timing (seconds). Attack reaches the pose, hold sustains it,
 // release relaxes back to idle. Ranges are randomized per gesture.
-const ATTACK_RANGE = [0.16, 0.26];
-const HOLD_RANGE = [0.45, 1.3];
-const RELEASE_RANGE = [0.32, 0.5];
+const ATTACK_RANGE = [0.34, 0.52];
+const HOLD_RANGE = [0.6, 1.6];
+const RELEASE_RANGE = [0.55, 0.85];
 
-// Rest gap between gestures, per energy tier. Low energy => long gaps => the
-// avatar mostly rests during calm/simple speech (fixes "always gesturing").
+// Minimum rest between full keyposes (seconds), per energy tier. These are
+// FLOORS only — gestures also require a prosodic onset (loudness rise), so the
+// actual spacing is irregular and much sparser than a fixed timer. Research
+// shows co-speech gesture density clusters around prosodic landmarks (phrase
+// boundaries / amplitude peaks), not a metronome (Danner et al.; McNeill).
+// Rough natural rates are ~8–15 full gestures/min even for animated speakers,
+// with long quiet stretches in between.
 const GAP_BY_TIER = {
-  low: [1.4, 3.0],
-  medium: [0.5, 1.4],
-  high: [0.15, 0.6],
+  low: [3.5, 7.0],
+  medium: [2.2, 5.0],
+  high: [1.4, 3.2],
 };
+// After a gesture finishes, chance we skip the next eligible onset entirely
+// (extra irregularity so it never feels like a beat clock).
+const SKIP_ONSET_CHANCE = 0.35;
+// How soon after speech starts the FIRST gesture may fire (still onset-gated).
+const FIRST_GESTURE_DELAY = [0.25, 0.7];
 
-// Chance a gesture uses both hands, per tier.
-const TWO_HAND_BY_TIER = { low: 0.1, medium: 0.3, high: 0.55 };
+// Chance a gesture uses both hands, per tier. Kept deliberately rare: natural
+// co-speech is predominantly unimanual; bimanual (two-hand) gestures are for
+// emphasis / global content only (Lausberg & Kita; McNeill). High random rates
+// made "raise both arms" fire out of context.
+const TWO_HAND_BY_TIER = { low: 0, medium: 0.04, high: 0.1 };
+// Two-hand only when speech is loud enough (prosodic emphasis).
+const TWO_HAND_MIN_AMPLITUDE = 0.5;
+// Minimum seconds between two-hand gestures so they stay special, not habitual.
+const TWO_HAND_COOLDOWN = 10;
 
-// Onset detection for accent beats (rising edge in loudness = emphasis).
-const ONSET_DELTA_THRESHOLD = 0.05;
-const ONSET_ABS_FLOOR = 0.09;
-const ACCENT_MIN_INTERVAL = 0.22;
+// Onset detection (rising edge in loudness = prosodic emphasis). Used both for
+// full keypose scheduling and for small accent flicks on a held pose.
+const ONSET_DELTA_THRESHOLD = 0.06;
+const ONSET_ABS_FLOOR = 0.14;
+// Full keyposes need a clearer peak than tiny accent flicks.
+const KEYPOSE_ONSET_DELTA = 0.09;
+const KEYPOSE_ONSET_FLOOR = 0.2;
+const ACCENT_MIN_INTERVAL = 0.35;
 
-// Accent spring dynamics (small, quick).
-const SPRING_STIFFNESS = 140;
-const SPRING_DAMPING = 16;
-const ACCENT_KICK = 3.2;
+// Accent spring dynamics (softened: lower stiffness + more damping = a gentle,
+// slower beat rather than a sharp flick).
+const SPRING_STIFFNESS = 80;
+const SPRING_DAMPING = 20;
+const ACCENT_KICK = 1.8;
 
 // Continuous sway.
-const SWAY_AMOUNT = 0.06;
+const SWAY_AMOUNT = 0.045;
 
-// Master weight easing (whole layer fades with speech).
-const WEIGHT_RAMP_UP = 4.0;
-const WEIGHT_RAMP_DOWN = 3.2;
+// --- Body-midline guard ----------------------------------------------------
+// Instead of a fat torso capsule (which can't tell a resting arm from a hand
+// crossing the chest), we keep each hand on its own side of the body: the
+// lateral shoulder-to-shoulder axis is measured from the live rig, and if a
+// wrist crosses past the allowed inner bound toward the far side, that arm is
+// abducted outward until the hand comes back. Pose- and convention-independent.
+const MIDLINE_ALLOWANCE_SCALE = 0.12; // how far past centre a hand may reach (× shoulder width)
+const PUSH_OUT_GAIN = 16;          // integral rate: abduction added per metre crossed per second
+const PUSH_OUT_MAX = 1.3;          // clamp so it can't fling the arm out
+const PUSH_OUT_RELAX = 1.5;        // radians/sec the correction relaxes once clear
+const DEBUG_COLLISION = true;      // log midline-crossing events (set false to quiet)
+
+// Master weight easing (whole layer fades with speech). Lower = softer, slower
+// fade in/out of the gesture layer as a whole.
+const WEIGHT_RAMP_UP = 2.4;
+const WEIGHT_RAMP_DOWN = 2.0;
 
 const TIER_ORDER = ['low', 'medium', 'high'];
 
@@ -122,17 +157,20 @@ const POSES = {
     dof: { armRaise: 0.5, armOut: 0.22, elbowBend: 0.72, wristPitch: 0.35 },
     fingers: 'open',
   },
-  // Both palms up / shrug — "what can you do".
+  // Both palms up / shrug — "what can you do". Two-hand only.
   shrug: {
     tier: 'medium',
     twoHand: true,
+    twoHandOnly: true,
     dof: { shrug: 0.55, armOut: 0.3, armTwist: 0.5, elbowBend: 0.9, wristPitch: -0.35 },
     fingers: 'open',
   },
-  // Big two-hand spread — high-energy exclamation.
+  // Big two-hand spread — high-energy exclamation. Requires twoHand (never
+  // played one-handed; looks odd without the pair) and the rare two-hand gate.
   bigSpread: {
     tier: 'high',
     twoHand: true,
+    twoHandOnly: true,
     dof: { armRaise: 0.45, armOut: 0.6, elbowBend: 0.8, wristPitch: -0.3, wristYaw: 0.2 },
     fingers: 'open',
   },
@@ -140,17 +178,22 @@ const POSES = {
 
 // Finger curl amounts per named hand shape. Applied to index/middle/ring/little
 // proximal+intermediate+distal joints (thumb left alone to avoid odd twists).
+// Kept modest so even a slightly-wrong axis doesn't look extreme.
 const FINGER_SHAPES = {
-  open: { Index: 0.05, Middle: 0.05, Ring: 0.08, Little: 0.1 },
-  relaxed: { Index: 0.25, Middle: 0.28, Ring: 0.32, Little: 0.36 },
-  point: { Index: 0.02, Middle: 1.15, Ring: 1.25, Little: 1.3 },
+  open: { Index: 0.04, Middle: 0.04, Ring: 0.06, Little: 0.08 },
+  relaxed: { Index: 0.18, Middle: 0.2, Ring: 0.24, Little: 0.28 },
+  point: { Index: 0.02, Middle: 0.7, Ring: 0.8, Little: 0.85 },
 };
 
 const FINGER_NAMES = ['Index', 'Middle', 'Ring', 'Little'];
 const FINGER_SEGMENTS = ['Proximal', 'Intermediate', 'Distal'];
 // Distribute a curl scalar across the three segments (proximal bends most).
-const FINGER_SEGMENT_WEIGHT = { Proximal: 0.5, Intermediate: 0.32, Distal: 0.5 };
-// Finger curl axis/sign (normalized VRM space); flip if fingers splay outward.
+const FINGER_SEGMENT_WEIGHT = { Proximal: 0.55, Intermediate: 0.35, Distal: 0.4 };
+// Finger curl axis/sign in normalized VRM space. Local axes vary across
+// VRoid/VRM exports, so curls are gated by APPLY_FINGER_CURLS (off by default)
+// until a correct mapping is verified for the model. When enabling, try
+// flipping the two signs together if fingers bend the wrong way.
+const APPLY_FINGER_CURLS = false;
 const FINGER_CURL_AXIS = 'z';
 const FINGER_CURL_SIGN = { right: -1, left: 1 };
 
@@ -162,9 +205,10 @@ function smoothstep(t) {
   return t * t * (3 - 2 * t);
 }
 
-// Slight overshoot on the attack so a gesture "reaches" and settles naturally.
+// Gentle overshoot on the attack so a gesture "reaches" and settles naturally.
+// Kept small (c1 low) so the motion glides into place instead of snapping.
 function easeOutBack(t) {
-  const c1 = 1.70158;
+  const c1 = 0.7;
   const c3 = c1 + 1;
   return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
 }
@@ -209,6 +253,7 @@ export class GestureController {
     this.nextGestureAt = 0;
     this.lastPoseKey = null;
     this.lastDominant = 'right';
+    this.lastTwoHandAt = -Infinity;
 
     // Accent + sway.
     this.accent = { left: new Spring(), right: new Spring() };
@@ -217,11 +262,25 @@ export class GestureController {
 
     // Rig.
     this.rig = null;
+    // Rest (base) local rotation of every managed bone, captured once. Bones the
+    // base clip does NOT animate (fingers, often shoulders) are reset to this
+    // each frame so our additive offsets can't accumulate/drift.
+    this._restQuat = new Map();      // bone -> THREE.Quaternion
+    this._animatedBones = new Set(); // bones the current base clip drives
+    this._managed = [];              // flat list of all managed bones
 
     // Scratch.
     this._euler = new THREE.Euler(0, 0, 0, 'XYZ');
     this._offsetQ = new THREE.Quaternion();
     this._baseQ = new THREE.Quaternion();
+    // Scratch for torso self-collision (world space).
+    this._capA = new THREE.Vector3();
+    this._capB = new THREE.Vector3();
+    this._wristW = new THREE.Vector3();
+    this._shoulderW = new THREE.Vector3();
+    this._nearest = new THREE.Vector3();
+    this._pushOut = { left: 0, right: 0 }; // eased outward correction per side
+    this._lastCollisionLog = 0;
 
     this.disposed = false;
     console.log('[Gesture] Keypose controller created.');
@@ -256,6 +315,10 @@ export class GestureController {
       right: armFor('right'),
       fingers: { left: fingersFor('left'), right: fingersFor('right') },
       spine: get('spine') ?? get('chest'),
+      // Bones used to build the torso collision capsule (see _pushOutOfTorso).
+      hips: get('hips'),
+      chest: get('upperChest') ?? get('chest') ?? get('spine'),
+      neck: get('neck') ?? get('head'),
     };
     const present = [];
     for (const side of ['left', 'right']) {
@@ -270,6 +333,23 @@ export class GestureController {
       }
     }
     console.log(`[Gesture] Rig: arms [${present.join(', ')}], ${fingerCount} finger bones, spine=${!!rig.spine}.`);
+
+    // Capture the rest local rotation of every bone we will offset, so we can
+    // rebuild each frame from a known base instead of compounding in place.
+    this._managed = [];
+    this._restQuat.clear();
+    const track = (bone) => {
+      if (bone && !this._restQuat.has(bone)) {
+        this._restQuat.set(bone, bone.quaternion.clone());
+        this._managed.push(bone);
+      }
+    };
+    for (const side of ['left', 'right']) {
+      track(rig[side].arm); track(rig[side].elbow); track(rig[side].wrist); track(rig[side].shoulder);
+      for (const f of FINGER_NAMES) for (const seg of FINGER_SEGMENTS) track(rig.fingers[side][f][seg]);
+    }
+    track(rig.spine);
+    console.log(`[Gesture] Captured rest pose for ${this._managed.length} managed bones.`);
     return rig;
   }
 
@@ -284,6 +364,7 @@ export class GestureController {
     this.baseEntry.action.play();
     this.baseEntry.action.setEffectiveWeight(1);
     this.rig = this._buildRig();
+    this._computeAnimatedBones(baseClip);
     console.log('[Gesture] Ready (keypose co-speech gestures).');
   }
 
@@ -294,12 +375,32 @@ export class GestureController {
     return { action, clip };
   }
 
+  // Figure out which managed bones the base clip actually drives. Bones NOT in
+  // this set are reset to their rest rotation each frame (so offsets on e.g.
+  // fingers, which the idle never touches, can't accumulate and stay stuck).
+  _computeAnimatedBones(clip) {
+    this._animatedBones = new Set();
+    if (!clip || !this.rig) return;
+    const names = new Set();
+    for (const track of clip.tracks) {
+      const dot = track.name.lastIndexOf('.');
+      names.add(dot >= 0 ? track.name.slice(0, dot) : track.name);
+    }
+    for (const bone of this._managed) {
+      if (bone && names.has(bone.name)) this._animatedBones.add(bone);
+    }
+    const total = this._managed.length;
+    const driven = this._animatedBones.size;
+    console.log(`[Gesture] Base clip drives ${driven}/${total} managed bones; ${total - driven} reset-to-rest each frame.`);
+  }
+
   setSpeaking(isSpeaking) {
     if (isSpeaking) {
       this.speechTail = SPEECH_TAIL_SECONDS;
       if (!this.speaking) {
         this.speaking = true;
-        this.nextGestureAt = this.elapsed + randomBetween(0.05, 0.18);
+        // Don't fire immediately — wait a beat, then only on a prosodic onset.
+        this.nextGestureAt = this.elapsed + randomBetween(...FIRST_GESTURE_DELAY);
         console.log('[Gesture] Speech started -> gesture layer engaging.');
       }
     } else if (this.speaking) {
@@ -330,6 +431,7 @@ export class GestureController {
     newEntry.action.play();
     newEntry.action.setEffectiveWeight(0);
     this.baseEntry = newEntry;
+    this._computeAnimatedBones(clip);
     this._fadeBase(newEntry.action, 1, CROSSFADE_SECONDS);
     if (oldEntry) {
       this._fadeBase(oldEntry.action, 0, CROSSFADE_SECONDS, () => {
@@ -405,30 +507,55 @@ export class GestureController {
         if (k >= 1) {
           console.log(`[Gesture] Gesture "${g.poseKey}" done.`);
           this.gesture = null;
+          // Floor gap only — the next fire still needs a prosodic onset, so the
+          // actual interval is longer and irregular.
           const gap = randomBetween(...(GAP_BY_TIER[tier] ?? GAP_BY_TIER.medium));
-          // Louder speech shortens the gap a touch (more animated).
-          this.nextGestureAt = this.elapsed + gap * (1 - 0.4 * amplitude);
+          this.nextGestureAt = this.elapsed + gap;
         }
       }
       return;
     }
 
-    // No active gesture: start one if speaking, past the rest gap, and audible.
-    if (this.speaking && this.elapsed >= this.nextGestureAt && amplitude > ONSET_ABS_FLOOR) {
-      this._startGesture(tier);
+    // No active gesture: only fire on a clear prosodic onset (loudness rise),
+    // past the rest floor, while speaking. This replaces a metronome timer with
+    // speech-driven, irregular density — matching how real co-speech gestures
+    // cluster around emphasis rather than ticking at fixed intervals.
+    if (!this.speaking || this.elapsed < this.nextGestureAt) return;
+    if (amplitude < KEYPOSE_ONSET_FLOOR) return;
+    const rising = amplitude - this.prevAmp;
+    if (rising < KEYPOSE_ONSET_DELTA) return;
+    // Extra irregularity: sometimes skip an otherwise-valid onset entirely.
+    if (Math.random() < SKIP_ONSET_CHANCE) {
+      this.nextGestureAt = this.elapsed + randomBetween(0.4, 1.2);
+      return;
     }
+    this._startGesture(tier, amplitude);
   }
 
-  _startGesture(tier) {
-    const poseKey = this._pickPose(tier);
+  // Whether a two-hand gesture is allowed right now. Research on co-speech
+  // gesture shows bimanual gestures are rare and reserved for emphasis / global
+  // content — not random decoration. Require high energy, loud speech, and a
+  // long cooldown so "both arms up" stays special and context-appropriate.
+  _allowTwoHand(tier, amplitude) {
+    if (tier === 'low') return false;
+    if (amplitude < TWO_HAND_MIN_AMPLITUDE) return false;
+    if (this.elapsed - this.lastTwoHandAt < TWO_HAND_COOLDOWN) return false;
+    return Math.random() < (TWO_HAND_BY_TIER[tier] ?? 0);
+  }
+
+  _startGesture(tier, amplitude = 0) {
+    const allowTwoHand = this._allowTwoHand(tier, amplitude);
+    const poseKey = this._pickPose(tier, allowTwoHand);
     if (!poseKey) return;
     const pose = POSES[poseKey];
 
-    // Sides: honour two-hand poses / tier chance, else alternate dominant hand.
+    // Two-hand only when (a) the gate allows it and (b) the pose supports it.
+    // twoHandOnly poses (e.g. bigSpread) are never played one-handed.
     let sides;
-    const twoHand = pose.twoHand && Math.random() < (TWO_HAND_BY_TIER[tier] ?? 0.3) + 0.2;
+    const twoHand = allowTwoHand && pose.twoHand;
     if (twoHand) {
       sides = ['left', 'right'];
+      this.lastTwoHandAt = this.elapsed;
     } else {
       const dom = this.lastDominant === 'right' ? 'left' : 'right';
       this.lastDominant = dom;
@@ -449,20 +576,28 @@ export class GestureController {
     console.log(`[Gesture] Start "${poseKey}" tier=${tier} sides=${sides.join('+')}.`);
   }
 
-  // Prefer poses matching the tier; avoid repeating the last pose.
-  _pickPose(tier) {
+  // Prefer poses matching the tier; avoid repeating the last pose. Exclude
+  // twoHandOnly poses when two-hand is not currently allowed.
+  _pickPose(tier, allowTwoHand = false) {
     const keys = Object.keys(POSES);
-    let pool = keys.filter((k) => POSES[k].tier === tier);
+    const eligible = (k) => {
+      const p = POSES[k];
+      if (p.twoHandOnly && !allowTwoHand) return false;
+      return true;
+    };
+    let pool = keys.filter((k) => POSES[k].tier === tier && eligible(k));
     // Fall back to neighbouring tiers if none / too few.
     if (pool.length < 2) {
       const idx = TIER_ORDER.indexOf(tier);
-      pool = keys.filter((k) => Math.abs(TIER_ORDER.indexOf(POSES[k].tier) - idx) <= 1);
+      pool = keys.filter(
+        (k) => Math.abs(TIER_ORDER.indexOf(POSES[k].tier) - idx) <= 1 && eligible(k)
+      );
     }
     if (pool.length > 1 && this.lastPoseKey) {
       const noRepeat = pool.filter((k) => k !== this.lastPoseKey);
       if (noRepeat.length) pool = noRepeat;
     }
-    return pool[Math.floor(Math.random() * pool.length)] ?? keys[0];
+    return pool[Math.floor(Math.random() * pool.length)] ?? keys.find(eligible) ?? keys[0];
   }
 
   // Fire small accent springs on loudness onsets during a held gesture.
@@ -485,9 +620,27 @@ export class GestureController {
       left: this.accent.left.update(delta),
       right: this.accent.right.update(delta),
     };
-    if (!this.rig || this.weight <= 0.001) return;
+    if (!this.rig) return;
 
-    this.swayPhase += delta * 1.8;
+    // Reset every bone the base clip does NOT animate back to its rest rotation.
+    // The mixer already refreshed the animated bones; these it never touches, so
+    // without this our additive offsets would compound every frame and stick
+    // (this was the cause of fingers bending backward and never relaxing).
+    for (const bone of this._managed) {
+      if (!this._animatedBones.has(bone)) {
+        bone.quaternion.copy(this._restQuat.get(bone));
+      }
+    }
+
+    // Fully idle: bones are at rest (animated ones from mixer, others reset
+    // above). Keep the collision correction decaying and skip offset work.
+    if (this.weight <= 0.001) {
+      this._pushOut.left = 0;
+      this._pushOut.right = 0;
+      return;
+    }
+
+    this.swayPhase += delta * 1.15;
     const g = this.gesture;
     const gw = g ? g.weight : 0;
     const pose = g ? POSES[g.poseKey] : null;
@@ -525,10 +678,30 @@ export class GestureController {
       acc.arm.z += s * 0.4 * DOF_AXIS.armOut.sign[side];
       acc.elbow.y += s * 0.6 * DOF_AXIS.elbowBend.sign[side];
 
+      // Torso self-collision guard: abduct outward by the eased correction
+      // measured last frame, so the wrist never crosses through the body.
+      acc.arm.z += this._pushOut[side] * DOF_AXIS.armOut.sign[side];
+
       this._applyBoneEuler(bones.arm, acc.arm);
       this._applyBoneEuler(bones.elbow, acc.elbow);
       this._applyBoneEuler(bones.wrist, acc.wrist);
       this._applyBoneEuler(bones.shoulder, acc.shoulder);
+
+      // Measure penetration with the rotations now applied and drive it to zero
+      // with an integral controller: while the wrist is inside the torso, keep
+      // adding outward abduction; once clear, relax the correction back down.
+      // (A proportional/eased target settles at nonzero penetration, which is
+      // why arms still passed through before.)
+      const penetration = this._torsoPenetration(side, bones);
+      if (penetration > 0) {
+        this._pushOut[side] = Math.min(
+          PUSH_OUT_MAX,
+          this._pushOut[side] + penetration * PUSH_OUT_GAIN * delta
+        );
+      } else {
+        // Clear: relax slowly so the arm doesn't snap back into the body.
+        this._pushOut[side] = Math.max(0, this._pushOut[side] - PUSH_OUT_RELAX * delta);
+      }
 
       // Fingers follow the pose's hand shape.
       const shape = inGesture && pose ? FINGER_SHAPES[pose.fingers] : null;
@@ -555,8 +728,74 @@ export class GestureController {
     bone.quaternion.copy(this._baseQ.multiply(this._offsetQ));
   }
 
+  // Body-midline guard. Returns how far (metres) this side's wrist has crossed
+  // past its allowed inner bound toward/through the far side of the body, i.e.
+  // the amount of outward abduction needed to keep the hand from passing
+  // through the torso. 0 if the hand is on its own side.
+  //
+  // Robust + convention-free: the lateral ("shoulder-to-shoulder") axis is
+  // derived from the live world positions of the two shoulders, so we don't
+  // guess which local axis points sideways. The right hand must stay on the
+  // right of the body centre; the left on the left. A small inward allowance
+  // lets hand-to-chest gestures reach the midline without triggering. Runs
+  // after the arm rotations are applied, so it sees the real resulting pose.
+  _torsoPenetration(side, bones) {
+    const wrist = bones.wrist;
+    const centreBone = this.rig.chest ?? this.rig.spine ?? this.rig.neck;
+    const lShoulder = this.rig.left.shoulder ?? this.rig.left.arm;
+    const rShoulder = this.rig.right.shoulder ?? this.rig.right.arm;
+    if (!wrist || !centreBone || !lShoulder || !rShoulder) return 0;
+
+    wrist.updateWorldMatrix(true, false);
+    centreBone.updateWorldMatrix(true, false);
+    lShoulder.updateWorldMatrix(true, false);
+    rShoulder.updateWorldMatrix(true, false);
+
+    this._wristW.setFromMatrixPosition(wrist.matrixWorld);
+    this._shoulderW.setFromMatrixPosition(rShoulder.matrixWorld);   // right
+    this._capA.setFromMatrixPosition(lShoulder.matrixWorld);        // left
+    this._capB.setFromMatrixPosition(centreBone.matrixWorld);       // body centre
+
+    // Lateral axis: from left shoulder toward right shoulder (world space).
+    this._nearest.copy(this._shoulderW).sub(this._capA);
+    const shoulderWidth = this._nearest.length();
+    if (shoulderWidth < 1e-4) return 0;
+    this._nearest.multiplyScalar(1 / shoulderWidth);               // unit lateral axis (points right)
+
+    // Signed lateral offset of the wrist from the body centre. Positive = toward
+    // the right shoulder side, negative = toward the left. (_shoulderW is free
+    // to reuse as scratch now.)
+    const lateral = this._shoulderW.copy(this._wristW).sub(this._capB).dot(this._nearest);
+
+    // Inner bound: the hand may reach this far toward centre but no further.
+    // Small negative allowance lets a hand touch the chest centre/opposite a
+    // touch without flagging. Beyond it, the hand is crossing the body.
+    const innerBound = -shoulderWidth * MIDLINE_ALLOWANCE_SCALE;
+    // Right side must stay >= innerBound; left side <= -innerBound (mirror).
+    const crossed = side === 'right'
+      ? innerBound - lateral       // >0 when right wrist went too far left
+      : lateral - (-innerBound);   // >0 when left wrist went too far right
+
+    if (DEBUG_COLLISION && crossed > 0 && this.elapsed - this._lastCollisionLog > 0.5) {
+      this._lastCollisionLog = this.elapsed;
+      console.log(
+        `[Gesture] ${side} wrist crossed midline: over=${crossed.toFixed(3)}m ` +
+        `lateral=${lateral.toFixed(3)}m bound=${innerBound.toFixed(3)}m ` +
+        `shoulderW=${shoulderWidth.toFixed(3)}m push=${this._pushOut[side].toFixed(3)}rad`
+      );
+    }
+    return crossed > 0 ? crossed : 0;
+  }
+
   // Curl fingers toward the target hand shape (weighted by gesture envelope).
+  // Disabled by default: finger local-axis conventions vary across VRoid/VRM
+  // exports, and a wrong curl axis/sign produces the "bent completely backward"
+  // look. With APPLY_FINGER_CURLS off, fingers stay at the VRM rest pose (and
+  // the rest-rebuild + Mixamo finger-track exclusion already keep them there).
+  // Flip FINGER_CURL_SIGN / FINGER_CURL_AXIS and set APPLY_FINGER_CURLS true
+  // once a correct mapping is verified for the model.
   _applyFingers(side, shape, weight) {
+    if (!APPLY_FINGER_CURLS) return;
     const hand = this.rig.fingers?.[side];
     if (!hand) return;
     const sign = FINGER_CURL_SIGN[side];

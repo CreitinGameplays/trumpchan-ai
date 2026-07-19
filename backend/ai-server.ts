@@ -1,4 +1,4 @@
-import { GoogleGenAI, LiveServerMessage, Modality, MediaResolution, Session, Type, Behavior, FunctionResponseScheduling } from '@google/genai';
+import { GoogleGenAI, LiveServerMessage, Modality, MediaResolution, Session, Type, Behavior, FunctionResponseScheduling, ThinkingLevel } from '@google/genai';
 import * as fs from 'fs/promises';
 import { existsSync, mkdirSync } from 'fs';
 import * as path from 'path';
@@ -157,21 +157,28 @@ async function saveHistory(history: any[]) {
 // Build the Live API session config. Rebuilt on every (re)connect so it can
 // pick up the latest session resumption handle.
 function buildLiveConfig(): any {
-    return {
+    // gemini-3.1-flash-live-preview rejects several 2.5-era setup fields with
+    // WebSocket close 1007 "Request contains an invalid argument":
+    //   - contextWindowCompression  → 1007
+    //   - thinkingBudget            → use thinkingLevel instead
+    //   - proactivity / affective dialog → 1007/1011
+    // See google/adk-python#5075 and the Live API 3.1 migration notes.
+    const config: any = {
         responseModalities: [Modality.AUDIO],
         outputAudioTranscription: {},
         inputAudioTranscription: {},
-        // Low thinking mode: give the model a small reasoning budget so it can
-        // briefly reason (e.g. pick the right emotion / tool call) without adding
-        // noticeable latency to the live audio. Set to 0 to fully disable.
+        // Gemini 3.x Live uses thinkingLevel (not thinkingBudget).
+        // MINIMAL keeps latency low while still allowing tool use.
         thinkingConfig: {
-            thinkingBudget: 0 // setting this to a higher value cause a bug in the model that makes it output "<ctrl46><ctrl46>" every turn.
+            thinkingLevel: ThinkingLevel.MINIMAL,
         },
-        mediaResolution: MediaResolution.MEDIA_RESOLUTION_MEDIUM,
+        // HIGH so the model can read more detail from the 3D scene / in-scene
+        // browser (text, UI). Costs more tokens per frame than MEDIUM.
+        mediaResolution: MediaResolution.MEDIA_RESOLUTION_HIGH,
         speechConfig: {
             voiceConfig: {
                 prebuiltVoiceConfig: {
-                    voiceName: 'Laomedeia',
+                    voiceName: 'Zephyr',
                 }
             }
         },
@@ -179,22 +186,22 @@ function buildLiveConfig(): any {
             parts: [{ text: geminiSysInstruction }]
         },
         tools: aiTools,
-        // Vision is always on: the frontend streams ~1 FPS video frames of the
-        // whole scene (avatar + floating browser). Audio+video sessions are
-        // capped at 2 minutes WITHOUT compression, so we MUST enable context
-        // window compression (sliding window) to keep the session alive.
-        contextWindowCompression: {
-            triggerTokens: '16000',
-            slidingWindow: { targetTokens: '4000' },
-        },
-        // The Live connection resets roughly every 10 minutes and the native-audio
-        // preview model also throws intermittent 1011 "internal errors". Session
-        // resumption lets us reconnect and continue the same conversation.
-        // Passing a stored handle (if any) resumes the previous session.
-        sessionResumption: sessionResumptionHandle
-            ? { handle: sessionResumptionHandle }
-            : {},
     };
+
+    // Session resumption: only include a handle when we have one. An empty
+    // sessionResumption object is fine for enabling updates; a stale handle
+    // is what causes 1007 reconnect loops (we drop it on 1007 in onclose).
+    if (sessionResumptionHandle) {
+        config.sessionResumption = { handle: sessionResumptionHandle };
+    } else {
+        config.sessionResumption = {};
+    }
+
+    // NOTE: Do NOT set contextWindowCompression on gemini-3.1-flash-live-preview —
+    // it is a documented 1007 cause. Audio+video sessions may be shorter without
+    // it; session resumption still helps across connection resets.
+
+    return config;
 }
 
 // (Re)connect the Gemini Live session. Safe to call repeatedly; it tears down
