@@ -1,7 +1,6 @@
 node_modules/
 node_modules/**
 dist/
-files/**
 build/**
 .env
 .venv/**
@@ -11,3 +10,4 @@ venv
 memory/
 tmp/**
 .DS_Store
+Pati.vrm
