@@ -1,7 +1,7 @@
 # AGENTS.md
 
 ## Dev environment tips
-- **External APIs:** Always use web search when you are unsure about how to use any external API integrated into this project.
+- **External APIs:** Always use web search when you are unsure about how to use any external API integrated into this project. Use websearch as many times as you want.
 
 ## Code style & conventions
 - **Debugging:** Ensure to always add console debugging to your code. This makes it easier to troubleshoot and fix issues later if any arise.
