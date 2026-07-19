@@ -6,15 +6,18 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
 import { loadMixamoAnimation } from './loadMixamoAnimation.js';
 import { GestureController } from './gestureSystem.js';
+import { SpatialController } from './spatialController.js';
 import { createBrowserWindow } from './browserWindow.js';
 import defaultVrmUrl from '../files/Pati.vrm?url';
 import defaultAnimationUrl from '../files/Standing-Idle.fbx?url';
+import walkAnimationUrl from '../files/Walking.fbx?url';
 
 const canvas = document.querySelector('#scene');
 const status = document.querySelector('#status');
 
 const DEFAULT_ALLOW_VERTICAL_MOTION = true;
-const DEFAULT_ALLOW_FLOOR_MOTION = true;
+// SpatialController owns world XZ; Mixamo floor root-motion must stay off.
+const DEFAULT_ALLOW_FLOOR_MOTION = false;
 const BLINK_INTERVAL_RANGE_SECONDS = [2.4, 5.8];
 const DOUBLE_BLINK_INTERVAL_RANGE_SECONDS = [0.1, 0.28];
 const DOUBLE_BLINK_CHANCE = 0.18;
@@ -110,9 +113,12 @@ let currentVrm = null;
 let currentVrmUrl = null;
 // Owns the AnimationMixer + persistent idle base + talking-gesture layer.
 let gestureController = null;
+// Avatar locomotion / look / walk in the 3D room (AI spatial tools).
+let spatialController = null;
 let currentAvatarRoot = null;
 let currentMotionRoot = null;
 let currentAnimationSource = null;
+
 
 // Live speech signals feeding the gesture system:
 //  - speechAmplitude: smoothed 0..1 loudness of the AI's outgoing audio.
@@ -685,6 +691,10 @@ function disposeCurrentModel() {
     gestureController.dispose();
     gestureController = null;
   }
+  if (spatialController) {
+    spatialController.dispose();
+    spatialController = null;
+  }
 
   if (!currentVrm) {
     return;
@@ -729,11 +739,20 @@ function frameModel(root) {
 }
 
 function resetModelPosition() {
-  if (!currentMotionRoot) {
+  if (!currentMotionRoot && !currentAvatarRoot) {
     return;
   }
 
-  currentMotionRoot.position.set(0, 0, 0);
+  if (currentMotionRoot) currentMotionRoot.position.set(0, 0, 0);
+  if (currentAvatarRoot) {
+    currentAvatarRoot.position.set(0, 0, 0);
+    currentAvatarRoot.rotation.y = 0;
+  }
+  if (spatialController) {
+    spatialController.yaw = 0;
+    spatialController.action = null;
+    if (spatialController._worldPos) spatialController._worldPos.set(0, 0, 0);
+  }
 
   gestureController?.resetBase();
 
@@ -741,6 +760,32 @@ function resetModelPosition() {
     frameModel(currentAvatarRoot ?? currentVrm.scene);
   }
 }
+
+function ensureSpatialController() {
+  if (spatialController) return spatialController;
+  spatialController = new SpatialController({
+    getAvatarRoot: () => currentAvatarRoot,
+    getMotionRoot: () => currentMotionRoot,
+    getGesture: () => gestureController,
+    getVrm: () => currentVrm,
+    getCamera: () => camera,
+    getBrowser: () => browserWindow?.cssObject ?? null,
+    scene,
+    idleUrl: defaultAnimationUrl,
+    walkUrl: walkAnimationUrl,
+    sendResult: (msg) => {
+      if (globalWs && globalWs.readyState === 1) {
+        globalWs.send(JSON.stringify(msg));
+      }
+    },
+  });
+  console.log('[Spatial] Controller ready.');
+  return spatialController;
+}
+
+// Scene pose is returned on every spatialResult (tool response). We do NOT
+// stream sceneState as realtime text — that can make Live treat it as user
+// input and start talking unprompted.
 
 async function loadVrm(url, label = 'default VRM') {
   disposeCurrentModel();
@@ -776,6 +821,16 @@ async function loadVrm(url, label = 'default VRM') {
     });
 
     frameModel(currentAvatarRoot);
+    ensureSpatialController();
+    // Fresh spawn: clear any prior world pose from a previous VRM session.
+    if (spatialController) {
+      spatialController.yaw = 0;
+      spatialController.action = null;
+      if (spatialController._worldPos) spatialController._worldPos.set(0, 0, 0);
+      currentAvatarRoot.position.set(0, 0, 0);
+      currentAvatarRoot.rotation.y = 0;
+      currentMotionRoot.position.set(0, 0, 0);
+    }
 
     if (currentAnimationSource) {
       await loadAnimation(currentAnimationSource.url, currentAnimationSource.name);
@@ -866,6 +921,7 @@ function animate() {
   controls.update();
   updateSpeechState();     // detect AI talking -> drive the gesture layer
   gestureController?.update(delta);
+  spatialController?.update(delta);
   updateHeadIdle(delta);
   updateNaturalGaze(delta);
   updateBlink(delta);
@@ -1094,6 +1150,10 @@ function handleApiCommand(cmd) {
       break;
     case 'resetPosition':
       resetModelPosition();
+      break;
+    case 'spatialCommand':
+      ensureSpatialController();
+      spatialController?.handleCommand(cmd);
       break;
   }
 }

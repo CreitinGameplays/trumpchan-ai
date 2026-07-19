@@ -144,6 +144,58 @@ Everything is driven by named constants / tables at the top of `src/gestureSyste
 
 No animation assets are required for gestures; the `files/talking_animations/` clips are no longer used.
 
+## Spatial Navigation (Embodied Avatar)
+
+The avatar moves in the 3D room using a **two-layer brain**:
+
+1. **Primary — Gemini Robotics-ER 1.6** (`backend/tools/robotics-planner.ts`): on complex spatial tools (`inspect_browser`, `walk_toward`, `walk`), the server sends the latest vision JPEG + goal to `gemini-robotics-er-1.6-preview` via `generateContent` (custom base URL / `XINJIANYA_KEY` supported). ER returns a short JSON plan of discrete steps.
+2. **Fallback — Live tool args**: if ER is disabled, errors, or returns no steps, the original Live function-call args are executed as a one-step plan.
+3. **Executor — Live path** (`src/spatialController.js`): always runs the plan (look / turn / walk). Not replaced by ER — ER only *plans*.
+
+Tools are declared in `backend/tools/spatial.ts`. Env: `XINJIANYA_KEY` (or `GEMINI_API_KEY`), optional `ROBOTICS_ER_BASE_URL` (default `https://aihub.071129.xyz`), `ROBOTICS_ER_MODEL`, `ROBOTICS_ER_ENABLED=0` to force fallback-only.
+
+### Flow
+
+1. Live model calls e.g. `inspect_browser`.
+2. Server asks Robotics-ER for a plan from the latest frame (or falls back).
+3. Server dispatches `{ type: "spatialCommand", name: "run_plan", steps: [...] }`.
+4. Frontend runs steps serially; replies `{ type: "spatialResult", ... }` with pose.
+5. Server sends tool response with **`WHEN_IDLE`** so the Live model can speak about what it sees.
+
+### Tools (model → server)
+
+| Tool | Purpose |
+|------|---------|
+| `look_at` | Gaze at `user` / `browser` / `home` / relative dirs |
+| `turn` | Rotate in place (`by_degrees` or `face_target`) |
+| `walk` | Short forward/back walk (seconds) |
+| `walk_toward` | Face + walk toward `user` / `browser` / `home` |
+| `stop_moving` | Cancel walk, idle |
+| `inspect_browser` | Face, approach, look at floating browser |
+| `reset_pose` | Home center, face user |
+
+### WS messages
+
+**`spatialCommand`** (server → frontend):
+```json
+{ "type": "spatialCommand", "id": "…", "name": "walk_toward", "args": { "target": "browser", "seconds": 2 } }
+```
+
+**`spatialResult`** (frontend → server):
+```json
+{ "type": "spatialResult", "id": "…", "name": "walk_toward", "result": { "ok": true, "x": 0.4, "z": -0.2, "yawDeg": 30, "distanceToBrowser": 1.1 } }
+```
+
+Floor radius ≈ 4.2 m. Walk uses `files/Walking.fbx` via the gesture controller base layer.
+
+### Locomotion (executor)
+
+- **World-space translation** on `avatarRoot.position` (XZ). Yaw on `avatarRoot.rotation.y`, normalized to (−π, π].
+- **Forward** each frame: `(sin(yaw), cos(yaw))` at ~0.72 m/s. Turn never changes position.
+- **`motionRoot` stays at origin**; Mixamo floor root-motion is disabled (`allowFloorMotion: false`) so walk clips cannot drag the body.
+- **`walk_toward` / `inspect_browser`** compute duration from remaining distance (arrive by `nearRadius`), not a fixed short timer alone.
+
+
 ## Outgoing Messages (server → frontend)
 
 Beyond `audio`, `caption`, and `emotion`, the server emits:

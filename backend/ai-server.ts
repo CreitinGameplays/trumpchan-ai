@@ -5,6 +5,19 @@ import * as path from 'path';
 import * as dotenv from 'dotenv';
 import WebSocket from 'ws';
 import { VoiceChanger } from './voice-changer.js';
+import {
+    spatialToolDeclarations,
+    isSpatialTool,
+    SpatialToolBridge,
+    silentToolResponse,
+    spatialToolResponse,
+} from './tools/spatial.js';
+import {
+    RoboticsSpatialPlanner,
+    shouldUseRoboticsPlanner,
+    fallbackPlanFromTool,
+    type SpatialStep,
+} from './tools/robotics-planner.js';
 
 // Load environment variables
 dotenv.config();
@@ -65,6 +78,12 @@ let geminiSysInstruction = '';
 // Lightweight throttle + logging counters for the incoming vision stream.
 let lastVisionFrameAt = 0;
 let visionFrameCount = 0;
+// Latest JPEG frame for Robotics-ER planning (base64, no data: prefix).
+let lastVisionJpeg: string | null = null;
+let lastVisionMime = 'image/jpeg';
+let lastVisionMeta = { width: 0, height: 0 };
+
+const roboticsPlanner = new RoboticsSpatialPlanner();
 
 // VRM native expression presets the avatar can display in real time.
 // These map 1:1 to @pixiv/three-vrm VRMExpressionPresetName emotion presets.
@@ -73,51 +92,82 @@ const VALID_EMOTIONS = ['neutral', 'happy', 'angry', 'sad', 'relaxed', 'surprise
 // Function-call tools exposed to the model. We use NON_BLOCKING behaviour so the
 // emote calls never pause/interrupt the audio (TTS) generation. Parsing emotes
 // out of the spoken text would break the TTS, so we rely on tool calls instead.
+const emotionToolDeclaration = {
+    name: 'set_emotion',
+    description:
+        "Set the avatar's facial expression in real time to match the emotional tone of what you are currently saying. " +
+        "Call this the instant your mood shifts (e.g. right before saying something cheerful, sad, angry, shocked, or calm). " +
+        "You can call it multiple times within a single reply as your tone changes. This only changes the face; it does not speak.",
+    behavior: Behavior.NON_BLOCKING,
+    parameters: {
+        type: Type.OBJECT,
+        required: ['emotion', 'duration'],
+        properties: {
+            emotion: {
+                type: Type.STRING,
+                enum: [...VALID_EMOTIONS],
+                description:
+                    "The emotion preset to display: " +
+                    "'happy' (joy, smiling, excited, playful), " +
+                    "'sad' (sorrow, disappointed, sympathetic), " +
+                    "'angry' (annoyed, frustrated, mock-pouting), " +
+                    "'surprised' (shocked, amazed, caught off guard), " +
+                    "'relaxed' (calm, cozy, content, soothing), " +
+                    "'neutral' (reset back to a natural resting face).",
+            },
+            intensity: {
+                type: Type.NUMBER,
+                description:
+                    "Optional strength of the expression from 0.0 to 1.0. Defaults to 1.0 (full). " +
+                    "Use a lower value (e.g. 0.5) for a subtle expression.",
+            },
+            duration: {
+                type: Type.NUMBER,
+                description:
+                    "Required. Duration in seconds to hold the expression before it automatically eases " +
+                    "back to the neutral resting face. Must be greater than 0. Use a short value for brief " +
+                    "reactions (e.g. 2 for a quick surprised gasp) and a larger value to sustain a mood.",
+            },
+        },
+    },
+};
+
 const aiTools = [
     {
         functionDeclarations: [
-            {
-                name: 'set_emotion',
-                description:
-                    "Set the avatar's facial expression in real time to match the emotional tone of what you are currently saying. " +
-                    "Call this the instant your mood shifts (e.g. right before saying something cheerful, sad, angry, shocked, or calm). " +
-                    "You can call it multiple times within a single reply as your tone changes. This only changes the face; it does not speak.",
-                behavior: Behavior.NON_BLOCKING,
-                parameters: {
-                    type: Type.OBJECT,
-                    required: ['emotion', 'duration'],
-                    properties: {
-                        emotion: {
-                            type: Type.STRING,
-                            enum: [...VALID_EMOTIONS],
-                            description:
-                                "The emotion preset to display: " +
-                                "'happy' (joy, smiling, excited, playful), " +
-                                "'sad' (sorrow, disappointed, sympathetic), " +
-                                "'angry' (annoyed, frustrated, mock-pouting), " +
-                                "'surprised' (shocked, amazed, caught off guard), " +
-                                "'relaxed' (calm, cozy, content, soothing), " +
-                                "'neutral' (reset back to a natural resting face).",
-                        },
-                        intensity: {
-                            type: Type.NUMBER,
-                            description:
-                                "Optional strength of the expression from 0.0 to 1.0. Defaults to 1.0 (full). " +
-                                "Use a lower value (e.g. 0.5) for a subtle expression.",
-                        },
-                        duration: {
-                            type: Type.NUMBER,
-                            description:
-                                "Required. Duration in seconds to hold the expression before it automatically eases " +
-                                "back to the neutral resting face. Must be greater than 0. Use a short value for brief " +
-                                "reactions (e.g. 2 for a quick surprised gasp) and a larger value to sustain a mood.",
-                        },
-                    },
-                },
-            },
+            emotionToolDeclaration,
+            ...spatialToolDeclarations,
         ],
     },
 ];
+
+/** Emotion: SILENT. Spatial: WHEN_IDLE so the model can narrate after moving. */
+function sendToolResult(
+    id: string,
+    name: string,
+    response: Record<string, unknown>,
+    mode: 'silent' | 'when_idle' = 'silent',
+) {
+    if (!geminiReady || !session) {
+        console.warn('[AI-TOOL] Cannot send tool result; session not ready.', name);
+        return;
+    }
+    try {
+        const fr =
+            mode === 'when_idle'
+                ? spatialToolResponse(id, name, response)
+                : silentToolResponse(id, name, response);
+        session.sendToolResponse({ functionResponses: [fr] });
+        console.log(`[AI-TOOL] Result ${name} (${mode}):`, JSON.stringify(response));
+    } catch (e) {
+        console.error('[AI-TOOL] Failed to send tool result:', e);
+    }
+}
+
+const spatialBridge = new SpatialToolBridge(
+    () => aiWsClient,
+    (id, name, response) => sendToolResult(id, name, response, 'when_idle'),
+);
 
 const responseQueue: LiveServerMessage[] = [];
 let currentGlobalCaption = "";
@@ -390,6 +440,13 @@ async function startAiServer() {
                 }
                 lastVisionFrameAt = now;
                 visionFrameCount++;
+                // Cache for Robotics-ER spatial planning (primary navigation brain).
+                lastVisionJpeg = String(cmd.data);
+                lastVisionMime = cmd.mimeType || 'image/jpeg';
+                lastVisionMeta = {
+                    width: Number(cmd.width) || 0,
+                    height: Number(cmd.height) || 0,
+                };
 
                 try {
                     session.sendRealtimeInput({
@@ -407,11 +464,24 @@ async function startAiServer() {
                 }
             }
 
+            // Frontend finished a spatial tool (walk/turn/look/etc.).
+            // Result includes pose/distances for closed-loop navigation.
+            else if (cmd.type === 'spatialResult' && cmd.id && cmd.name) {
+                const pending = spatialBridge.resolvePending(String(cmd.id));
+                if (!pending) {
+                    console.warn('[SPATIAL] Unexpected result for id', cmd.id);
+                    return;
+                }
+                const result =
+                    cmd.result && typeof cmd.result === 'object'
+                        ? (cmd.result as Record<string, unknown>)
+                        : { ok: true, result: cmd.result };
+                sendToolResult(String(cmd.id), String(cmd.name), result, 'when_idle');
+            }
+
             // NOTE: Browser interactions (page loads / navigation) must NOT
-            // trigger the AI. We deliberately do not accept any grounding-text
-            // message here, so loading a webpage never provokes a response. The
-            // AI still passively sees the page via the vision frames above and
-            // only reacts when the user actually speaks/types.
+            // trigger the AI. We deliberately do not accept chat-like grounding
+            // for navigation events. Scene pose is passive context only.
         } catch (e) {
             console.error('Error handling WS command from main Server', e);
         }
@@ -423,60 +493,146 @@ async function startAiServer() {
     });
 }
 
+function handleSetEmotion(functionCall: any) {
+    const rawEmotion = String(functionCall.args?.emotion ?? '').toLowerCase().trim();
+    const emotion = (VALID_EMOTIONS as readonly string[]).includes(rawEmotion)
+        ? rawEmotion
+        : 'neutral';
+
+    let intensity = Number(functionCall.args?.intensity);
+    if (!Number.isFinite(intensity)) intensity = 1.0;
+    intensity = Math.max(0, Math.min(1, intensity));
+
+    const DEFAULT_EMOTION_DURATION = 2;
+    let duration = Number(functionCall.args?.duration);
+    if (!Number.isFinite(duration) || duration <= 0) duration = DEFAULT_EMOTION_DURATION;
+
+    if (rawEmotion !== emotion) {
+        console.warn(`[AI-TOOL] Unknown emotion "${rawEmotion}", falling back to "neutral".`);
+    }
+
+    if (aiWsClient && aiWsClient.readyState === WebSocket.OPEN) {
+        aiWsClient.send(JSON.stringify({
+            type: 'emotion',
+            emotion,
+            intensity,
+            duration,
+        }));
+        console.log(`[AI-TOOL] Sent emotion "${emotion}" (intensity ${intensity}, duration ${duration}s).`);
+    } else {
+        console.warn('[AI-TOOL] Visualizer WS not connected; emotion not delivered.');
+    }
+
+    return silentToolResponse(functionCall.id, functionCall.name, { result: 'ok', emotion, intensity, duration });
+}
+
+/**
+ * Dispatch a multi-step spatial plan to the visualizer as one run_plan command.
+ * The frontend executes steps serially and returns a single spatialResult.
+ */
+function dispatchSpatialPlan(
+    toolCallId: string,
+    originalName: string,
+    steps: SpatialStep[],
+    meta: Record<string, unknown>,
+): boolean {
+    return spatialBridge.dispatch(toolCallId, 'run_plan', {
+        steps,
+        originalName,
+        ...meta,
+    });
+}
+
+async function handleSpatialToolWithPlanner(functionCall: any) {
+    const name = String(functionCall.name);
+    const args = (functionCall.args ?? {}) as Record<string, unknown>;
+    const id = String(functionCall.id);
+
+    // Fast path: simple tools never need ER (look/turn/stop/reset).
+    if (!shouldUseRoboticsPlanner(name) || !lastVisionJpeg || !roboticsPlanner.isAvailable()) {
+        const plan = fallbackPlanFromTool(name, args);
+        const ok = dispatchSpatialPlan(id, name, plan.steps, {
+            planner: plan.source,
+            reasoning: plan.reasoning,
+        });
+        if (!ok) {
+            sendToolResult(id, name, { ok: false, error: 'visualizer_offline' }, 'when_idle');
+        }
+        return;
+    }
+
+    const goal =
+        name === 'inspect_browser'
+            ? 'Look at / approach the floating browser panel and get ready to describe the page.'
+            : name === 'walk_toward'
+              ? `Walk toward ${String(args.target || 'browser')}.`
+              : name === 'walk'
+                ? `Walk ${String(args.direction || 'forward')} for a short step.`
+                : `Execute spatial action ${name} with args ${JSON.stringify(args)}`;
+
+    console.log(`[SPATIAL] Robotics-ER primary plan for ${name}…`);
+    const plan = await roboticsPlanner.planFromFrame({
+        jpegBase64: lastVisionJpeg,
+        mimeType: lastVisionMime,
+        goal,
+        sceneHint: `frame ${lastVisionMeta.width}x${lastVisionMeta.height}; live tool was ${name}`,
+    });
+
+    const steps =
+        plan.ok && plan.steps.length > 0
+            ? plan.steps
+            : fallbackPlanFromTool(name, args).steps;
+
+    if (!plan.ok) {
+        console.warn(`[SPATIAL] ER failed (${plan.error}); using Live tool fallback for ${name}.`);
+    }
+
+    const ok = dispatchSpatialPlan(id, name, steps, {
+        planner: plan.ok ? 'robotics-er' : 'fallback',
+        reasoning: plan.reasoning,
+        erError: plan.error,
+        erLatencyMs: plan.latencyMs,
+    });
+    if (!ok) {
+        sendToolResult(id, name, { ok: false, error: 'visualizer_offline' }, 'when_idle');
+    }
+}
+
 function handleToolCalls(functionCalls: any[]) {
-    const functionResponses = functionCalls.map((functionCall) => {
+    const immediateResponses: any[] = [];
+
+    for (const functionCall of functionCalls) {
         console.log(`[AI-TOOL] ${functionCall.name} args:`, JSON.stringify(functionCall.args));
 
         if (functionCall.name === 'set_emotion') {
-            const rawEmotion = String(functionCall.args?.emotion ?? '').toLowerCase().trim();
-            const emotion = (VALID_EMOTIONS as readonly string[]).includes(rawEmotion)
-                ? rawEmotion
-                : 'neutral';
-
-            // Clamp intensity to [0, 1], default to full expression.
-            let intensity = Number(functionCall.args?.intensity);
-            if (!Number.isFinite(intensity)) intensity = 1.0;
-            intensity = Math.max(0, Math.min(1, intensity));
-
-            // Duration in seconds to hold before auto-reverting to neutral.
-            // Must be greater than 0; if omitted/invalid/<=0, fall back to a
-            // sensible default so the expression always eases back on its own.
-            const DEFAULT_EMOTION_DURATION = 2;
-            let duration = Number(functionCall.args?.duration);
-            if (!Number.isFinite(duration) || duration <= 0) duration = DEFAULT_EMOTION_DURATION;
-
-            if (rawEmotion !== emotion) {
-                console.warn(`[AI-TOOL] Unknown emotion "${rawEmotion}", falling back to "neutral".`);
-            }
-
-            // Forward the emotion to the frontend visualizer over WebSocket.
-            if (aiWsClient && aiWsClient.readyState === WebSocket.OPEN) {
-                aiWsClient.send(JSON.stringify({
-                    type: 'emotion',
-                    emotion,
-                    intensity,
-                    duration,
-                }));
-                console.log(`[AI-TOOL] Sent emotion "${emotion}" (intensity ${intensity}, duration ${duration}s) to visualizer.`);
-            } else {
-                console.warn('[AI-TOOL] Visualizer WS not connected; emotion not delivered.');
-            }
-        } else {
-            console.warn(`[AI-TOOL] Received unknown tool call: ${functionCall.name}`);
+            immediateResponses.push(handleSetEmotion(functionCall));
+            continue;
         }
 
-        // Respond SILENT so the tool result never triggers extra model output
-        // and never interrupts the ongoing audio (TTS) stream.
-        return {
-            id: functionCall.id,
-            name: functionCall.name,
-            response: { result: 'ok' },
-            scheduling: FunctionResponseScheduling.SILENT,
-        };
-    });
+        if (isSpatialTool(functionCall.name)) {
+            // Fire-and-forget async planner+dispatch (does not block other tools).
+            handleSpatialToolWithPlanner(functionCall).catch((e) => {
+                console.error('[SPATIAL] Planner dispatch error:', e);
+                sendToolResult(
+                    String(functionCall.id),
+                    String(functionCall.name),
+                    { ok: false, error: String(e?.message ?? e) },
+                    'when_idle',
+                );
+            });
+            continue;
+        }
 
+        console.warn(`[AI-TOOL] Unknown tool call: ${functionCall.name}`);
+        immediateResponses.push(silentToolResponse(functionCall.id, functionCall.name, {
+            ok: false,
+            error: 'unknown_tool',
+        }));
+    }
+
+    if (immediateResponses.length === 0) return;
     try {
-        session?.sendToolResponse({ functionResponses });
+        session?.sendToolResponse({ functionResponses: immediateResponses });
     } catch (e) {
         console.error('[AI-TOOL] Failed to send tool response:', e);
     }

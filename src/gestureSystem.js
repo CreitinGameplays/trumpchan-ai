@@ -358,7 +358,7 @@ export class GestureController {
     const baseClip = await loadMixamoAnimation(baseClipUrl, this.vrm, {
       allowVerticalMotion: true,
       allowFloorMotion: false,
-      rootMotionNodeName: this.motionRootName,
+      rootMotionNodeName: null,
     });
     this.baseEntry = this._makeEntry(baseClip);
     this.baseEntry.action.play();
@@ -419,12 +419,13 @@ export class GestureController {
     if (fast) this.weight = Math.min(this.weight, 0.4);
   }
 
-  async setBaseAnimation(url, { allowVerticalMotion = true, allowFloorMotion = true } = {}) {
-    console.log('[Gesture] Swapping base animation...');
+  async setBaseAnimation(url, { allowVerticalMotion = true, allowFloorMotion = false } = {}) {
+    console.log(`[Gesture] Swapping base animation (floorMotion=${allowFloorMotion})...`);
     const clip = await loadMixamoAnimation(url, this.vrm, {
       allowVerticalMotion,
       allowFloorMotion,
-      rootMotionNodeName: this.motionRootName,
+      // Only bind root-motion tracks when explicitly allowed.
+      rootMotionNodeName: allowFloorMotion ? this.motionRootName : null,
     });
     const oldEntry = this.baseEntry;
     const newEntry = this._makeEntry(clip);
