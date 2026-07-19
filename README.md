@@ -151,4 +151,5 @@ GEMINI_API_KEY=api-key-here
 FFMPEG_BINARY=ffmpeg
 VOICE_CHANGER_CONFIG=./voice-changer-config.json
 VOICE_CHANGER_ENABLED=true/false
+XINJIANYA_KEY=key
 ```
