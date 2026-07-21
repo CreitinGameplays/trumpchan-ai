@@ -174,6 +174,32 @@ const POSES = {
     dof: { armRaise: 0.45, armOut: 0.6, elbowBend: 0.8, wristPitch: -0.3, wristYaw: 0.2 },
     fingers: 'open',
   },
+  // Reach toward floating browser / screen (right-hand biased in playBrowserInteract).
+  reachBrowser: {
+    tier: 'medium',
+    dof: { armRaise: 0.55, armOut: 0.35, armTwist: 0.15, elbowBend: 0.85, wristPitch: -0.2, wristYaw: 0.1 },
+    fingers: 'point',
+  },
+  // Click / tap motion — slightly more extended, index point.
+  clickBrowser: {
+    tier: 'high',
+    dof: { armRaise: 0.62, armOut: 0.28, armTwist: 0.1, elbowBend: 0.7, wristPitch: -0.35 },
+    fingers: 'point',
+  },
+  // Hover / move mouse — softer reach, open hand.
+  hoverBrowser: {
+    tier: 'medium',
+    dof: { armRaise: 0.48, armOut: 0.32, elbowBend: 0.95, wristPitch: -0.15 },
+    fingers: 'open',
+  },
+  // Type on browser — both hands near mid-body.
+  typeBrowser: {
+    tier: 'medium',
+    twoHand: true,
+    twoHandOnly: true,
+    dof: { armRaise: 0.38, armOut: 0.18, elbowBend: 1.15, wristPitch: 0.15 },
+    fingers: 'relaxed',
+  },
 };
 
 // Finger curl amounts per named hand shape. Applied to index/middle/ring/little
@@ -401,7 +427,7 @@ export class GestureController {
         this.speaking = true;
         // Don't fire immediately — wait a beat, then only on a prosodic onset.
         this.nextGestureAt = this.elapsed + randomBetween(...FIRST_GESTURE_DELAY);
-        console.log('[Gesture] Speech started -> gesture layer engaging.');
+
       }
     } else if (this.speaking) {
       this.speechTail = Math.min(this.speechTail, SPEECH_TAIL_SECONDS);
@@ -417,6 +443,64 @@ export class GestureController {
       this.gesture.release = fast ? 0.18 : randomBetween(...RELEASE_RANGE);
     }
     if (fast) this.weight = Math.min(this.weight, 0.4);
+  }
+
+  /**
+   * Force a keypose for browser interaction (reach / click / type).
+   * Preempts co-speech scheduling so the arm motion is readable on tool use.
+   * @param {'reach'|'click'|'hover'|'type'|'move'|'check'} kind
+   * @param {{ side?: 'left'|'right', hold?: number }} [opts]
+   */
+  playBrowserInteract(kind = 'reach', opts = {}) {
+    if (!this.rig) {
+      console.warn('[Gesture] playBrowserInteract: no rig');
+      return false;
+    }
+    const map = {
+      reach: 'reachBrowser',
+      click: 'clickBrowser',
+      dblclick: 'clickBrowser',
+      hover: 'hoverBrowser',
+      move: 'hoverBrowser',
+      check: 'clickBrowser',
+      type: 'typeBrowser',
+      key: 'typeBrowser',
+      scroll: 'hoverBrowser',
+      select: 'reachBrowser',
+    };
+    const poseKey = map[String(kind)] || 'reachBrowser';
+    const pose = POSES[poseKey];
+    if (!pose) return false;
+
+    let sides;
+    if (pose.twoHandOnly || pose.twoHand) {
+      sides = ['left', 'right'];
+    } else {
+      const side = opts.side === 'left' || opts.side === 'right' ? opts.side : 'right';
+      sides = [side];
+      this.lastDominant = side;
+    }
+
+    const hold = Number(opts.hold);
+    this.gesture = {
+      poseKey,
+      sides,
+      phase: 'attack',
+      t: 0,
+      weight: 0,
+      attack: 0.28,
+      hold: Number.isFinite(hold) && hold > 0 ? hold : kind === 'type' ? 1.1 : 0.55,
+      release: 0.45,
+      browser: true,
+    };
+    this.lastPoseKey = poseKey;
+    // Hold master weight for the gesture duration even when not speaking
+    this.weight = Math.max(this.weight, 0.95);
+    this._browserInteractUntil =
+      this.elapsed + this.gesture.attack + this.gesture.hold + this.gesture.release + 0.15;
+    this.nextGestureAt = this._browserInteractUntil + 0.4;
+
+    return true;
   }
 
   async setBaseAnimation(url, { allowVerticalMotion = true, allowFloorMotion = false } = {}) {
@@ -463,12 +547,13 @@ export class GestureController {
     const tier = TIER_ORDER.includes(mood.tierBias) ? mood.tierBias : 'medium';
 
     // 2) Speech tail -> stop speaking after the grace period.
+    //    Do not cut off an active browser-interact pose mid-hold.
     if (this.speaking) {
       this.speechTail -= delta;
       if (this.speechTail <= 0) {
         this.speaking = false;
-        console.log('[Gesture] Speech ended -> relaxing to idle.');
-        if (this.gesture && this.gesture.phase !== 'release') {
+
+        if (this.gesture && this.gesture.phase !== 'release' && !this.gesture.browser) {
           this.gesture.phase = 'release';
           this.gesture.t = 0;
         }
@@ -479,8 +564,10 @@ export class GestureController {
     this._updateGesture(delta, amplitude, tier);
     this._updateAccents(delta, amplitude, tier);
 
-    // 4) Master weight eases with speaking state.
-    const target = this.speaking ? 1 : 0;
+    // 4) Master weight eases with speaking state (or forced browser interact).
+    const browserHold =
+      this._browserInteractUntil != null && this.elapsed < this._browserInteractUntil;
+    const target = this.speaking || browserHold || (this.gesture && this.gesture.browser) ? 1 : 0;
     const rate = target > this.weight ? WEIGHT_RAMP_UP : WEIGHT_RAMP_DOWN;
     this.weight += (target - this.weight) * Math.min(1, rate * delta);
 
@@ -506,7 +593,7 @@ export class GestureController {
         const k = Math.min(1, g.t / g.release);
         g.weight = 1 - smoothstep(k);
         if (k >= 1) {
-          console.log(`[Gesture] Gesture "${g.poseKey}" done.`);
+
           this.gesture = null;
           // Floor gap only — the next fire still needs a prosodic onset, so the
           // actual interval is longer and irregular.

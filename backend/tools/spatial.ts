@@ -14,7 +14,11 @@ export const SPATIAL_TOOL_NAMES = [
   'stop_moving',
   'inspect_browser',
   'reset_pose',
-  // Internal multi-step plan from Robotics-ER (or Live fallback).
+  // FPV visual grounding: click/look/go at what you see (x,y 0–1 preferred).
+  'view_click',
+  'view_look',
+  'view_go',
+  // Internal multi-step plan from VisionPlanner / flash-lite (or Live fallback).
   'run_plan',
 ] as const;
 
@@ -135,10 +139,11 @@ export const spatialToolDeclarations = [
   {
     name: 'inspect_browser',
     description:
-      "BEST tool when the user asks you to look at the browser / page. " +
-      "Faces the floating browser, walks closer if needed, looks at the screen. " +
-      "When the tool result returns, you MUST speak and describe what you actually see on the page " +
-      "(use your vision frames). Do not stay silent after this tool.",
+      "Stand in front of the floating browser and look at it (body only — no clicks). " +
+      "REQUIRED before describing page content or using browser tools if the panel is small, angled, or not filling your first-person view. " +
+      "When the user asks you to SEE or USE the page, call this first so the content is readable, then SPEAK or use_browser / browser_*. " +
+      "Result includes grounding.entities (scene graph). Prefer that + newest vision over inventing room/page content. " +
+      "Do not stay silent after this tool when the user asked you to look.",
     behavior: Behavior.NON_BLOCKING,
     parameters: {
       type: Type.OBJECT,
@@ -157,6 +162,86 @@ export const spatialToolDeclarations = [
     parameters: {
       type: Type.OBJECT,
       properties: {},
+    },
+  },
+  {
+    name: 'view_click',
+    description:
+      "PRIMARY AND ONLY way to click in the 3D world and on the floating browser page. " +
+      "Do NOT use browser_click (deprecated). " +
+      "PREFERRED: pass numeric image coordinates x,y in 0–1 over the full first-person frame " +
+      "((0,0)=top-left, (1,0)=top-right, (0,1)=bottom-left, (1,1)=bottom-right). " +
+      "Example: view_click({ x: 0.42, y: 0.61 }). Estimate from the yellow 0.0–1.0 rulers on the vision overlay. " +
+      "Use browserBounds minX/maxX/minY/maxY and center from prior results so clicks land on the panel. " +
+      "Optional legacy: cell='H6' if you must. Rays hit browser page (Playwright), toolbar, or floor. " +
+      "Stand close with inspect_browser first. For double-click pass clickCount=2.",
+    behavior: Behavior.NON_BLOCKING,
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        x: {
+          type: Type.NUMBER,
+          description:
+            'REQUIRED preferred: horizontal position 0–1 across the FPV image (0=left, 0.5=center, 1=right). May also pass pixels 0–1280.',
+        },
+        y: {
+          type: Type.NUMBER,
+          description:
+            'REQUIRED preferred: vertical position 0–1 across the FPV image (0=top, 0.5=middle, 1=bottom). May also pass pixels 0–720.',
+        },
+        cell: {
+          type: Type.STRING,
+          description: "Legacy optional grid cell (e.g. 'H6') if x,y omitted. Prefer x,y instead.",
+        },
+        sub: {
+          type: Type.NUMBER,
+          description: 'Legacy optional 1–9 sub-cell when using cell= only.',
+        },
+        dx: {
+          type: Type.NUMBER,
+          description: 'Optional fine nudge -1..1 applied after x,y (or cell).',
+        },
+        dy: {
+          type: Type.NUMBER,
+          description: 'Optional fine nudge -1..1 applied after x,y (or cell).',
+        },
+        clickCount: {
+          type: Type.NUMBER,
+          description: '1 = single click (default), 2 = double-click.',
+        },
+      },
+    },
+  },
+  {
+    name: 'view_look',
+    description:
+      "Look toward a point you see in first-person vision. Prefer x,y in 0–1 ((0,0)=top-left). Does not click.",
+    behavior: Behavior.NON_BLOCKING,
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        x: { type: Type.NUMBER, description: 'View x 0–1 (left→right). Preferred.' },
+        y: { type: Type.NUMBER, description: 'View y 0–1 (top→bottom). Preferred.' },
+        cell: { type: Type.STRING, description: 'Legacy optional cell if x,y omitted.' },
+        sub: { type: Type.NUMBER, description: 'Legacy optional sub-cell 1–9.' },
+        dx: { type: Type.NUMBER, description: 'Optional nudge -1..1.' },
+        dy: { type: Type.NUMBER, description: 'Optional nudge -1..1.' },
+      },
+    },
+  },
+  {
+    name: 'view_go',
+    description:
+      "Walk toward what you see: floor point → walk there; browser panel → approach the panel. Prefer x,y 0–1.",
+    behavior: Behavior.NON_BLOCKING,
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        x: { type: Type.NUMBER, description: 'View x 0–1. Preferred.' },
+        y: { type: Type.NUMBER, description: 'View y 0–1. Preferred.' },
+        cell: { type: Type.STRING, description: 'Legacy optional cell.' },
+        sub: { type: Type.NUMBER, description: 'Legacy optional sub-cell 1–9.' },
+      },
     },
   },
 ];
@@ -194,6 +279,15 @@ export class SpatialToolBridge {
     // Clear any prior pending with same id (shouldn't happen)
     this.clearPending(id);
 
+    // view_click / multi-step run_plan (often ER + click) need more time than pure locomotion.
+    const waitMs =
+      name === 'view_click' ||
+      name === 'view_go' ||
+      name === 'view_look' ||
+      name === 'run_plan'
+        ? Math.max(this.timeoutMs, 45000)
+        : this.timeoutMs;
+
     const timer = setTimeout(() => {
       if (!this.pending.has(id)) return;
       this.pending.delete(id);
@@ -203,7 +297,7 @@ export class SpatialToolBridge {
         error: 'timeout',
         message: 'Movement timed out; assume you stayed roughly where you were.',
       });
-    }, this.timeoutMs);
+    }, waitMs);
 
     this.pending.set(id, { id, name, timer });
 
@@ -238,6 +332,18 @@ export class SpatialToolBridge {
   clearAll() {
     for (const entry of this.pending.values()) clearTimeout(entry.timer);
     this.pending.clear();
+  }
+
+  hasPending(): boolean {
+    return this.pending.size > 0;
+  }
+
+  pendingCount(): number {
+    return this.pending.size;
+  }
+
+  pendingIds(): string[] {
+    return [...this.pending.keys()];
   }
 }
 

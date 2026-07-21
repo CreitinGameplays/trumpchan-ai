@@ -62,7 +62,7 @@ npm run dev:electron
 ```
 
 This starts the Vite dev server, the backend WebSocket/API server, the AI
-backend, and an Electron window all at once. Electron uses a `<webview>` for the
+backend, and an Electron window all at once. Electron uses a main-process offscreen browser (painted on a 3D plane) for the
 in-scene browser, which loads pages as top-level navigations and works with
 essentially all sites.
 
@@ -71,7 +71,7 @@ A `GEMINI_API_KEY` in `.env` is required for the AI backend to start (see the
 
 ## How to use
 
-1. Start the app with `npm run dev` (browser tab) or `npm run dev:electron` (Electron).
+1. Start the app with `npm run dev` (browser tab) or `npm run dev:electron` (Electron). AI vision is **first-person from the avatar’s head** by default (walk toward the browser to see the page). Set `TRUMPCHAN_VISION_MODE=window` for old full-window capture.
 2. Trumpchan loads automatically.
 3. The idle loop from `Standing-Idle.fbx` starts automatically.
 4. Orbit, pan, and zoom the camera with your mouse.
@@ -83,7 +83,7 @@ The scene renders a real, interactive browser window floating in 3D space,
 implemented in `src/browserWindow.js` using Three.js `CSS3DRenderer`.
 
 - It includes a navigation toolbar: back, forward, and reload buttons plus a URL/search bar. Type a full URL, a bare domain (auto-prefixed with `https://`), or free text (routed to a Google search) and press Enter.
-- Under Electron (`npm run dev:electron`) it uses a `<webview>`, so it works with essentially all websites and the back/forward history is fully functional.
+- Under Electron (`npm run dev:electron`) the guest page is **Playwright Chromium** with a **persistent profile** (cookies/logins kept under Electron `userData/playwright-browser-profile`). Screenshots stream onto a WebGL plane. AI control uses **Playwright locators** + **axTree refs**. First run: `npx playwright install chromium`.
 - In a plain browser tab (`npm run dev`) it falls back to an `<iframe>`, which many sites block via `X-Frame-Options` / CSP headers. Back/forward is limited to same-origin history. Use permissive test URLs such as `https://example.com` or `https://threejs.org`.
 - Because the window lives in a DOM layer composited over the WebGL canvas, it always draws on top and cannot be occluded by the 3D model.
 
@@ -110,9 +110,10 @@ browserWindow.reload()
 - `src/main.js` - Three.js + Trumpchan viewer logic
 - `src/loadMixamoAnimation.js` - Mixamo FBX retargeting for VRM humanoid bones
 - `src/mixamoVRMRigMap.js` - Mixamo-to-VRM bone mapping
-- `src/browserWindow.js` - floating in-scene browser window with nav toolbar (CSS3D + webview/iframe)
+- `src/browserWindow.js` - floating in-scene browser (WebGL texture plane + toolbar; iframe fallback)
 - `src/style.css` - page styling
-- `electron/main.js` - Electron main process (enables the `<webview>` in-scene browser)
+- `electron/main.js` / `browserService.js` / `axSnapshot.js` / `preload.cjs` - Electron main + Playwright Chromium guest browser
+- `src/browserController.js` - AI browser tool executor
 - `backend/server.js` - HTTP + WebSocket command server
 - `backend/ai-server.ts` - Gemini Live AI proxy
 - `backend/voice-changer.ts` - ffmpeg-based voice effect
@@ -136,7 +137,7 @@ The production files will be created in `dist/`.
 ## npm scripts
 
 - `npm run dev` - Vite + backend server + AI backend (browser-tab mode)
-- `npm run dev:electron` - same as above plus an Electron window (webview in-scene browser)
+- `npm run dev:electron` - same as above plus Electron (offscreen in-scene browser)
 - `npm run dev:vite` - Vite dev server only
 - `npm run dev:server` - backend WebSocket/API server only
 - `npm run dev:ai` - AI backend only (waits for the server on port 3000)

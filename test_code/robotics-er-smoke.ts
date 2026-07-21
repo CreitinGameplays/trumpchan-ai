@@ -1,10 +1,9 @@
 /**
- * Smoke-test Gemini Robotics-ER 1.6 via the configured proxy/key.
+ * Smoke-test VisionPlanner (gemini-3.1-flash-lite) via the configured proxy/key.
  * Usage: npx tsx test_code/robotics-er-smoke.ts
  */
 import 'dotenv/config';
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import { createRequire } from 'node:module';
 
 // Minimal 8x8 red JPEG (valid) as a tiny vision probe
 const TINY_JPEG_B64 =
@@ -16,10 +15,17 @@ async function main() {
     console.error('No XINJIANYA_KEY or GEMINI_API_KEY');
     process.exit(1);
   }
-  const baseUrl = process.env.ROBOTICS_ER_BASE_URL || process.env.XINJIANYA_BASE_URL || 'https://aihub.071129.xyz';
-  const modelId = process.env.ROBOTICS_ER_MODEL || 'gemini-robotics-er-1.6-preview';
+  const baseUrl =
+    process.env.VISION_PLANNER_BASE_URL ||
+    process.env.ROBOTICS_ER_BASE_URL ||
+    process.env.XINJIANYA_BASE_URL ||
+    'https://aihub.071129.xyz';
+  const modelId =
+    process.env.VISION_PLANNER_MODEL ||
+    process.env.ROBOTICS_ER_MODEL ||
+    'gemini-3.1-flash-lite';
 
-  console.log('Testing Robotics-ER', { modelId, baseUrl: baseUrl.slice(0, 40) + '…' });
+  console.log('Testing VisionPlanner (flash-lite)', { modelId, baseUrl: baseUrl.slice(0, 40) + '…' });
 
   const genAI = new GoogleGenerativeAI(key);
   const model = genAI.getGenerativeModel({ model: modelId }, { baseUrl } as any);
@@ -33,8 +39,8 @@ async function main() {
           { inlineData: { mimeType: 'image/jpeg', data: TINY_JPEG_B64 } },
           {
             text:
-              'Return ONLY JSON: {"reasoning":"test","steps":[{"name":"look_at","args":{"target":"browser"}}]} ' +
-              'Allowed step names: look_at, turn, walk, walk_toward, inspect_browser, reset_pose, stop_moving.',
+              'Return ONLY JSON: {"reasoning":"test","steps":[{"name":"view_click","args":{"x":0.5,"y":0.5}}]} ' +
+              'Allowed step names: look_at, turn, walk, walk_toward, inspect_browser, reset_pose, stop_moving, view_click, view_look, view_go.',
           },
         ],
       },

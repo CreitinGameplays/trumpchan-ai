@@ -2,72 +2,95 @@ import { app, BrowserWindow } from 'electron';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
+import { initBrowserService, disposeBrowserService } from './browserService.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// Dev: load the Vite dev server. Prod: load the built files in dist/.
 const DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL || 'http://localhost:5173';
 const isDev = !app.isPackaged;
 
-// --- Vision streaming config ---
-// We capture the FULL composited window (3D avatar + room + the live floating
-// browser content) as a single image and stream it to the AI. This lets Gemini
-// literally "see" everything on screen, including whatever page the in-scene
-// browser is showing - no URL fetching or DOM scraping involved.
+// Vision: by default the *renderer* streams avatar first-person frames (src/main.js).
+// Set TRUMPCHAN_VISION_MODE=window to fall back to full-window capturePage (third-person).
+// The live website is Playwright Chromium; screenshots stream onto the plane (browserService).
 const HUB_WS_URL = 'ws://localhost:3000';
-const VISION_FPS = 1; // Gemini Live API caps video input at ~1 frame/sec.
+const VISION_MODE = (process.env.TRUMPCHAN_VISION_MODE || 'avatar').toLowerCase(); // 'avatar' | 'window'
+const VISION_FPS = 1;
 const VISION_FRAME_INTERVAL_MS = Math.round(1000 / VISION_FPS);
-// Slightly above the classic 768 recommendation so browser text/UI stays
-// readable. Paired with MEDIA_RESOLUTION_HIGH on the AI server.
 const VISION_MAX_DIM = 1024;
-const VISION_JPEG_QUALITY = 88; // 0-100; higher = clearer browser content
+const VISION_JPEG_QUALITY = 88;
+let visionSeq = 0;
 
 function createWindow() {
   console.log('[Electron] Creating main window, isDev:', isDev);
+
+  const preloadPath = path.join(__dirname, 'preload.cjs');
+  console.log('[Electron] Preload path:', preloadPath);
 
   const win = new BrowserWindow({
     width: 1400,
     height: 900,
     backgroundColor: '#d8e6ec',
     webPreferences: {
-      // Required so the app can use the <webview> tag for the in-scene browser.
-      webviewTag: true,
+      webviewTag: false,
       contextIsolation: true,
       nodeIntegration: false,
+      preload: preloadPath,
     },
   });
 
+  // Always load the 3D UI first — browser service must never block the shell.
   if (isDev) {
     console.log('[Electron] Loading dev server:', DEV_SERVER_URL);
-    win.loadURL(DEV_SERVER_URL);
+    win.loadURL(DEV_SERVER_URL).catch((e) => console.error('[Electron] loadURL failed:', e));
   } else {
     const indexPath = path.join(__dirname, '..', 'dist', 'index.html');
     console.log('[Electron] Loading built file:', indexPath);
-    win.loadFile(indexPath);
+    win.loadFile(indexPath).catch((e) => console.error('[Electron] loadFile failed:', e));
+  }
+
+  // Offscreen browser after shell starts loading.
+  try {
+    initBrowserService(win);
+  } catch (e) {
+    console.error('[Electron] Browser service init error:', e);
   }
 
   win.webContents.on('did-fail-load', (_e, code, desc, url) => {
     console.error('[Electron] Failed to load:', code, desc, url);
   });
 
-  // Start streaming what's on screen to the AI once the page is ready.
-  win.webContents.once('did-finish-load', () => {
-    console.log('[Vision] Main window finished loading, starting vision stream.');
-    startVisionStream(win);
+  win.webContents.on('console-message', (_e, level, message, line, sourceId) => {
+    const tag = ['log', 'warn', 'error'][level] || 'log';
+    console.log(`[Renderer:${tag}] ${message}`);
   });
+
+  win.webContents.once('did-finish-load', () => {
+    if (VISION_MODE === 'window') {
+      console.log('[Vision] Mode=window — starting main-window capturePage stream.');
+      startVisionStream(win);
+    } else {
+      console.log(
+        '[Vision] Mode=avatar — first-person frames come from the renderer (head camera). Window capture OFF.',
+      );
+    }
+  });
+
+  if (isDev) {
+    win.webContents.openDevTools({ mode: 'detach' });
+  }
 
   return win;
 }
 
 // ---------------------------------------------------------------------------
-// Vision streaming: capture the composited window and push frames to the AI.
+// Vision streaming
 // ---------------------------------------------------------------------------
 
 let visionWs = null;
 let visionWsReady = false;
 let visionTimer = null;
 let visionReconnectTimer = null;
-let capturing = false; // guards against overlapping async captures
+let capturing = false;
 
 function connectVisionHub() {
   console.log('[Vision] Connecting to hub at', HUB_WS_URL);
@@ -87,7 +110,6 @@ function connectVisionHub() {
   visionWs.on('error', (err) => {
     visionWsReady = false;
     console.error('[Vision] Hub WebSocket error:', err.message);
-    // 'close' will typically follow and trigger the reconnect.
   });
 }
 
@@ -101,27 +123,31 @@ function scheduleVisionReconnect() {
 
 function startVisionStream(win) {
   connectVisionHub();
-
   if (visionTimer) clearInterval(visionTimer);
   visionTimer = setInterval(() => captureAndSend(win), VISION_FRAME_INTERVAL_MS);
   console.log(`[Vision] Streaming at ${VISION_FPS} FPS (every ${VISION_FRAME_INTERVAL_MS}ms).`);
 }
 
 async function captureAndSend(win) {
-  if (capturing) return; // skip if the previous capture hasn't finished
+  if (capturing) return;
   if (!win || win.isDestroyed()) return;
   if (!visionWsReady || !visionWs || visionWs.readyState !== WebSocket.OPEN) return;
-  // Don't waste captures while the window is minimized/hidden.
   if (win.isMinimized() || !win.isVisible()) return;
 
   capturing = true;
   try {
-    // capturePage() grabs the fully composited window: the WebGL 3D scene AND
-    // the <webview> browser content layered on top, exactly as the user sees it.
-    let image = await win.webContents.capturePage();
+    let image = await Promise.race([
+      win.webContents.capturePage(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('capture_timeout')), 3000)),
+    ]);
 
-    // Downscale to <=VISION_MAX_DIM on the longest side for Live API video.
+    if (!image || (typeof image.isEmpty === 'function' && image.isEmpty())) {
+      return;
+    }
+
     const size = image.getSize();
+    if (!size.width || !size.height) return;
+
     const longest = Math.max(size.width, size.height);
     if (longest > VISION_MAX_DIM) {
       const scale = VISION_MAX_DIM / longest;
@@ -133,33 +159,51 @@ async function captureAndSend(win) {
     }
 
     const jpeg = image.toJPEG(VISION_JPEG_QUALITY);
-    if (!jpeg || jpeg.length === 0) {
-      console.warn('[Vision] capturePage produced an empty frame, skipping.');
-      return;
-    }
+    if (!jpeg || jpeg.length === 0) return;
 
     const finalSize = image.getSize();
-    visionWs.send(JSON.stringify({
-      type: 'visionFrame',
-      mimeType: 'image/jpeg',
-      data: jpeg.toString('base64'),
-      width: finalSize.width,
-      height: finalSize.height,
-      ts: Date.now(),
-    }));
-    console.log(`[Vision] Sent frame ${finalSize.width}x${finalSize.height} (${(jpeg.length / 1024).toFixed(1)} KB).`);
+    if (visionWs && visionWs.readyState === WebSocket.OPEN) {
+      visionSeq += 1;
+      const ts = Date.now();
+      visionWs.send(
+        JSON.stringify({
+          type: 'visionFrame',
+          mimeType: 'image/jpeg',
+          data: jpeg.toString('base64'),
+          width: finalSize.width,
+          height: finalSize.height,
+          ts,
+          seq: visionSeq,
+          source: 'window-capture',
+        }),
+      );
+      console.log(
+        `[Vision] Sent frame #${visionSeq} ${finalSize.width}x${finalSize.height} ` +
+          `(${(jpeg.length / 1024).toFixed(1)} KB) ts=${ts}`,
+      );
+    }
   } catch (err) {
-    console.error('[Vision] Capture/send failed:', err.message);
+    console.warn('[Vision] Capture/send skipped:', err.message);
   } finally {
     capturing = false;
   }
 }
 
 function stopVisionStream() {
-  if (visionTimer) { clearInterval(visionTimer); visionTimer = null; }
-  if (visionReconnectTimer) { clearTimeout(visionReconnectTimer); visionReconnectTimer = null; }
+  if (visionTimer) {
+    clearInterval(visionTimer);
+    visionTimer = null;
+  }
+  if (visionReconnectTimer) {
+    clearTimeout(visionReconnectTimer);
+    visionReconnectTimer = null;
+  }
   if (visionWs) {
-    try { visionWs.close(); } catch { /* ignore */ }
+    try {
+      visionWs.close();
+    } catch {
+      /* ignore */
+    }
     visionWs = null;
   }
   visionWsReady = false;
@@ -175,9 +219,11 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {
   stopVisionStream();
+  disposeBrowserService();
   if (process.platform !== 'darwin') app.quit();
 });
 
 app.on('before-quit', () => {
   stopVisionStream();
+  disposeBrowserService();
 });

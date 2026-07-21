@@ -9,20 +9,30 @@ import * as THREE from 'three';
  * Translation is ALWAYS world-space on avatarRoot.position.
  * Yaw is ALWAYS avatarRoot.rotation.y (normalized to (-π, π]).
  * Walk uses world forward from current yaw each frame — never local Z under a
- * rotating parent (that + floor-clamp on local coords caused wrong directions
- * and edge teleports when combined with Mixamo floor root-motion).
+ * rotating parent. When Rapier physics is ready, walk XZ is resolved through
+ * a kinematic capsule (walls / browser panel) via moveAvatarCapsule.
  *
  * Commands are serialized (queue) so concurrent tool calls from Gemini do not
  * race (e.g. turn + look_at finishing out of order).
  */
 
+import { isPhysicsReady, moveAvatarCapsule, setAvatarPosition } from './physicsWorld.js';
+
 const FLOOR_RADIUS = 4.2;
 const WALK_SPEED = 0.72; // m/s world forward (slower = more controllable)
 const TURN_SPEED = 2.4; // rad/s
 const LOOK_HOLD_DEFAULT = 5;
+// Floor (XZ) stop distance for browser — NEVER 3D distance (panel y≈1, root y=0).
+// ~1.35m XZ → eye≈1.4m to panel center ≈1.45m → panel fills ~75–80% of 58° FPV
+// (0.75m was face-in-the-screen: angular size ~78° > FOV, corners clipped).
 const NEAR_BROWSER = 1.35;
 const NEAR_HOME = 0.35;
 const NEAR_USER = 1.8;
+
+/** Horizontal (floor) distance — locomotion only moves on XZ. */
+function horizontalDist(a, b) {
+  return Math.hypot(a.x - b.x, a.z - b.z);
+}
 const DEFAULT_WALK_SECONDS = 2.5;
 const MAX_WALK_SECONDS = 8;
 const MIN_WALK_SECONDS = 0.4;
@@ -90,7 +100,7 @@ export class SpatialController {
       name: String(cmd.name),
       args: cmd.args && typeof cmd.args === 'object' ? cmd.args : {},
     });
-    console.log(`[Spatial] Queued ${cmd.name} (queue=${this.queue.length})`, cmd.id);
+    // quiet: queue
     this._pumpQueue();
   }
 
@@ -132,16 +142,24 @@ export class SpatialController {
 
       const step = WALK_SPEED * a.direction * delta;
       // World forward from current yaw: +Z at yaw=0 → (sin(yaw), cos(yaw)).
-      this._worldPos.x += Math.sin(this.yaw) * step;
-      this._worldPos.z += Math.cos(this.yaw) * step;
-      this._clampToFloor(this._worldPos);
+      const desired = {
+        x: this._worldPos.x + Math.sin(this.yaw) * step,
+        z: this._worldPos.z + Math.cos(this.yaw) * step,
+      };
+      this._applyWalkDesired(desired);
       this._syncRoots();
 
       if (a.kind === 'walk_toward' && a.nearRadius != null && a.faceTarget) {
-        const dist = this._avatarWorldPos().distanceTo(a.faceTarget);
+        // Browser/home targets have elevated Y — use XZ so nearRadius is reachable.
+        const useXz = a.nearUseXz === true || a.targetName === 'browser' || a.targetName === 'home';
+        const pos = this._avatarWorldPos();
+        const dist = useXz
+          ? horizontalDist(pos, a.faceTarget)
+          : pos.distanceTo(a.faceTarget);
         if (dist <= a.nearRadius) {
           console.log(
-            `[Spatial] Arrived near ${a.targetName || 'target'} dist=${dist.toFixed(2)}`,
+            `[Spatial] Arrived near ${a.targetName || 'target'} ` +
+              `dist=${dist.toFixed(2)} (${useXz ? 'xz' : '3d'}) near=${a.nearRadius}`,
           );
           this._completeAction({ arrived: true });
           return;
@@ -158,31 +176,127 @@ export class SpatialController {
     const pos = this._avatarWorldPos();
     const browser = this._browserWorldPos();
     const user = this._userWorldPos();
-    const distBrowser = browser ? pos.distanceTo(browser) : null;
-    const distUser = user ? pos.distanceTo(user) : null;
+    const distBrowser3d = browser ? pos.distanceTo(browser) : null;
+    const distBrowserXz = browser ? horizontalDist(pos, browser) : null;
+    const distUser = user ? horizontalDist(pos, user) : null;
     const facingUser = user
       ? Math.abs(shortestAngleDelta(this.yaw, this._yawTowardWorldPoint(user))) < 0.5
       : false;
     const facingBrowser = browser
       ? Math.abs(shortestAngleDelta(this.yaw, this._yawTowardWorldPoint(browser))) < 0.55
       : false;
+    const nearBrowser = distBrowserXz != null && distBrowserXz <= NEAR_BROWSER;
+    const yawDeg = Number(THREE.MathUtils.radToDeg(normalizeYaw(this.yaw)).toFixed(1));
+
+    // Extensible named-entity registry for hybrid vision grounding (future props plug in here).
+    const entities = [
+      {
+        id: 'avatar',
+        kind: 'self',
+        x: Number(pos.x.toFixed(2)),
+        y: 0,
+        z: Number(pos.z.toFixed(2)),
+        yawDeg,
+        eyeY: 1.4,
+      },
+      {
+        id: 'home',
+        kind: 'spawn',
+        x: 0,
+        y: 0,
+        z: 0,
+        distanceXz: Number(horizontalDist(pos, { x: 0, z: 0 }).toFixed(2)),
+      },
+    ];
+    if (browser) {
+      entities.push({
+        id: 'browser',
+        kind: 'browser_panel',
+        x: Number(browser.x.toFixed(2)),
+        y: Number((browser.y || 1).toFixed(2)),
+        z: Number(browser.z.toFixed(2)),
+        distanceXz: distBrowserXz != null ? Number(distBrowserXz.toFixed(2)) : null,
+        distance3d: distBrowser3d != null ? Number(distBrowser3d.toFixed(2)) : null,
+        facing: facingBrowser,
+        near: nearBrowser,
+        interactable: true,
+      });
+    }
+    if (user) {
+      entities.push({
+        id: 'user',
+        kind: 'spectator',
+        x: Number(user.x.toFixed(2)),
+        y: 0,
+        z: Number(user.z.toFixed(2)),
+        distanceXz: distUser != null ? Number(distUser.toFixed(2)) : null,
+        facing: facingUser,
+      });
+    }
+
+    let primaryView = 'room';
+    if (facingBrowser && nearBrowser) primaryView = 'browser_close';
+    else if (facingBrowser) primaryView = 'browser_far';
+    else if (facingUser) primaryView = 'user';
+
+    const grounding = {
+      schema: 'trumpchan.scene.v1',
+      ts: Date.now(),
+      avatar: {
+        x: Number(pos.x.toFixed(2)),
+        z: Number(pos.z.toFixed(2)),
+        yawDeg,
+        walking: this.walking,
+        eyeY: 1.4,
+      },
+      primaryView,
+      entities,
+      rules: [
+        'Prefer this scene graph over inventing room objects.',
+        'Only describe page text when primaryView is browser_close or vision clearly shows the panel large.',
+        'Observed vs inferred: mark guesses as unknown; do not invent UI or props.',
+        'FPV images use x,y 0–1 ((0,0)=top-left); use view_click({x,y}) / view_look / view_go on the panel.',
+      ],
+      visionCoords: {
+        system: 'xy_0_1',
+        origin: 'top-left',
+        x: '0=left … 1=right',
+        y: '0=top … 1=bottom',
+        tools: ['view_click', 'view_look', 'view_go'],
+        example: { x: 0.42, y: 0.61 },
+      },
+      reobserve:
+        'After this result, use your newest first-person frame (x,y rulers) + this graph before the next claim or tool.',
+    };
 
     return {
       ok: true,
       x: Number(pos.x.toFixed(2)),
       z: Number(pos.z.toFixed(2)),
-      yawDeg: Number(THREE.MathUtils.radToDeg(normalizeYaw(this.yaw)).toFixed(1)),
+      yawDeg,
       walking: this.walking,
-      distanceToBrowser: distBrowser != null ? Number(distBrowser.toFixed(2)) : null,
+      // Prefer floor distance for tools / model reasoning (matches walk stop).
+      distanceToBrowser: distBrowserXz != null ? Number(distBrowserXz.toFixed(2)) : null,
+      distanceToBrowser3d: distBrowser3d != null ? Number(distBrowser3d.toFixed(2)) : null,
       distanceToUser: distUser != null ? Number(distUser.toFixed(2)) : null,
+      nearBrowser,
+      nearBrowserRadius: NEAR_BROWSER,
       facingUser,
       facingBrowser,
+      primaryView,
       floorRadius: FLOOR_RADIUS,
-      hint: facingBrowser
-        ? 'You are facing the floating browser — describe what you see on the page.'
-        : facingUser
-          ? 'You are facing the user.'
-          : 'You may need to look_at or turn toward browser/user.',
+      entities,
+      grounding,
+      physics: isPhysicsReady(),
+      hint: facingBrowser && nearBrowser
+        ? 'First-person: standing close to the floating browser — page should fill most of your view. Re-check vision before describing text.'
+        : facingBrowser
+          ? 'First-person: facing the browser but not close yet — walk closer if the page looks small.'
+          : facingUser
+            ? 'First-person: you are facing the user.'
+            : 'First-person vision: walk/turn toward browser or user to see them.',
+      instruction:
+        'Use grounding.entities as ground truth for positions. Vision confirms what is currently visible. Do not invent objects not listed unless clearly in your FPV frame.',
     };
   }
 
@@ -213,7 +327,13 @@ export class SpatialController {
 
   async _runCommand(cmd) {
     const { id, name, args } = cmd;
-    console.log(`[Spatial] Run ${name}`, id, args);
+
+
+    // Top-level view_* (fallback path when not wrapped in run_plan)
+    if (name === 'view_click' || name === 'view_look' || name === 'view_go') {
+      await this._executeImmediate(id, name, args);
+      return;
+    }
 
     switch (name) {
       case 'run_plan':
@@ -276,21 +396,36 @@ export class SpatialController {
       const stepId = `${id}__step${i}`;
       const result = await this._runStepAndWait(stepId, stepName, stepArgs);
       stepResults.push({ name: stepName, result });
-      console.log(`[Spatial] Plan step ${i + 1}/${steps.length} ${stepName} done`, result?.ok !== false);
+
     }
 
     const last = stepResults[stepResults.length - 1]?.result || {};
+    const hadViewClick = stepResults.some((s) => s.name === 'view_click');
+    const lastView = [...stepResults].reverse().find((s) => String(s.name).startsWith('view_'));
     this._finish(id, originalName, {
       ok: true,
       planner,
       reasoning,
       stepsRun: stepResults.map((s) => s.name),
+      stepResults: stepResults.map((s) => ({
+        name: s.name,
+        ok: s.result?.ok !== false,
+        hit: s.result?.hit,
+        cell: s.result?.view?.cell || s.result?.cell,
+        page: s.result?.page,
+        action: s.result?.action,
+        error: s.result?.error,
+      })),
+      ...(lastView?.result && typeof lastView.result === 'object' ? lastView.result : {}),
       ...this.getSceneState(),
       instruction:
-        originalName === 'inspect_browser' ||
-        steps.some((s) => s?.name === 'inspect_browser' || s?.name === 'look_at')
-          ? 'Describe what you actually see on the floating browser / in the room now using your vision.'
-          : last.instruction,
+        hadViewClick
+          ? last.instruction ||
+            'Click executed via VisionPlanner (flash-lite) refined x,y. Re-check newest FPV before next click.'
+          : originalName === 'inspect_browser' ||
+              steps.some((s) => s?.name === 'inspect_browser' || s?.name === 'look_at')
+            ? 'First-person vision: describe only what you can see from your avatar eyes right now (browser only if you are facing/near it).'
+            : last.instruction,
     });
   }
 
@@ -316,9 +451,12 @@ export class SpatialController {
         prevSend?.(msg);
       };
 
+      // view_click may wait on Playwright; allow longer than pure locomotion
+      const timeoutMs =
+        name === 'view_click' || name === 'view_go' || name === 'view_look' ? 25000 : 15000;
       timer = setTimeout(() => {
         settleOnce({ ok: false, error: 'step_timeout', name });
-      }, 15000);
+      }, timeoutMs);
 
       this._executeImmediate(stepId, name, args).catch((e) => {
         settleOnce({ ok: false, error: String(e?.message ?? e) });
@@ -327,6 +465,29 @@ export class SpatialController {
   }
 
   async _executeImmediate(id, name, args) {
+    // FPV view tools — run via optional executor (wired from main.js)
+    if (name === 'view_click' || name === 'view_look' || name === 'view_go') {
+      if (typeof this.opts.executeViewTool === 'function') {
+        try {
+          const result = await this.opts.executeViewTool(name, args || {});
+          this._finish(id, name, {
+            ok: result?.ok !== false,
+            ...(result && typeof result === 'object' ? result : {}),
+            reobserve: result?.reobserve || 'Use newest FPV frame (with grid) before next action.',
+          });
+        } catch (e) {
+          this._finish(id, name, { ok: false, error: String(e?.message ?? e) });
+        }
+        return;
+      }
+      this._finish(id, name, {
+        ok: false,
+        error: 'view_executor_missing',
+        message: 'view_* steps need executeViewTool on SpatialController.',
+      });
+      return;
+    }
+
     switch (name) {
       case 'look_at':
         await this._cmdLookAt(id, args);
@@ -447,6 +608,8 @@ export class SpatialController {
       target === 'browser' ? NEAR_BROWSER :
       target === 'home' ? NEAR_HOME :
       NEAR_USER;
+    // Elevated targets (browser y≈1, home y≈1.45): measure stop distance on the floor plane.
+    const nearUseXz = target === 'browser' || target === 'home';
 
     // Face target (rotation only — no translation).
     this.yaw = this._yawTowardWorldPoint(point);
@@ -454,26 +617,37 @@ export class SpatialController {
     this._setLookAt(point, LOOK_HOLD_DEFAULT + 3);
 
     const pos = this._avatarWorldPos();
-    const dist = pos.distanceTo(point);
+    const dist3d = pos.distanceTo(point);
+    const dist = nearUseXz ? horizontalDist(pos, point) : dist3d;
     console.log(
-      `[Spatial] walk_toward ${target} dist=${dist.toFixed(2)} near=${near} ` +
-        `yaw=${THREE.MathUtils.radToDeg(this.yaw).toFixed(1)}°`,
+      `[Spatial] walk_toward ${target} dist=${dist.toFixed(2)} (${nearUseXz ? 'xz' : '3d'}) ` +
+        `dist3d=${dist3d.toFixed(2)} near=${near} ` +
+        `yaw=${THREE.MathUtils.radToDeg(this.yaw).toFixed(1)}° ` +
+        `root=(${pos.x.toFixed(2)},${pos.z.toFixed(2)}) target=(${point.x.toFixed(2)},${point.y.toFixed(2)},${point.z.toFixed(2)})`,
     );
 
     if (dist <= near) {
       await this._setWalking(false);
-      this._finish(id, 'walk_toward', { arrived: true, alreadyClose: true, ...this.getSceneState() });
+      this._finish(id, 'walk_toward', {
+        arrived: true,
+        alreadyClose: true,
+        nearMetric: nearUseXz ? 'xz' : '3d',
+        ...this.getSceneState(),
+      });
       return;
     }
 
-    // Duration from remaining distance; model seconds only extends, never shortens.
+    // Duration from remaining floor distance; model seconds only extends, never shortens.
     const travel = Math.max(0, dist - near * 0.85);
     let seconds = travel / WALK_SPEED + 0.25;
     const argSec = Number(args.seconds);
     if (Number.isFinite(argSec)) seconds = Math.max(seconds, argSec);
     seconds = clamp(seconds, MIN_WALK_SECONDS, MAX_WALK_SECONDS);
 
-    console.log(`[Spatial] walk_toward duration=${seconds.toFixed(2)}s travel≈${travel.toFixed(2)}m`);
+    console.log(
+      `[Spatial] walk_toward duration=${seconds.toFixed(2)}s travel≈${travel.toFixed(2)}m ` +
+        `(${nearUseXz ? 'xz' : '3d'})`,
+    );
 
     await this._setWalking(true);
     this._beginAction({
@@ -485,6 +659,7 @@ export class SpatialController {
       direction: 1,
       faceTarget: point.clone(),
       nearRadius: near,
+      nearUseXz,
       targetName: target,
     });
   }
@@ -507,26 +682,39 @@ export class SpatialController {
     this._setLookAt(point, LOOK_HOLD_DEFAULT + 4);
 
     const pos = this._avatarWorldPos();
-    const dist = pos.distanceTo(point);
-    console.log(`[Spatial] inspect_browser dist=${dist.toFixed(2)} near=${NEAR_BROWSER}`);
+    // XZ only — 3D dist includes ~1m height and could never fall below NEAR_BROWSER.
+    const distXz = horizontalDist(pos, point);
+    const dist3d = pos.distanceTo(point);
+    console.log(
+      `[Spatial] inspect_browser distXz=${distXz.toFixed(2)} dist3d=${dist3d.toFixed(2)} ` +
+        `near=${NEAR_BROWSER} (xz) root=(${pos.x.toFixed(2)},${pos.z.toFixed(2)}) ` +
+        `browser=(${point.x.toFixed(2)},${point.y.toFixed(2)},${point.z.toFixed(2)})`,
+    );
 
-    if (dist <= NEAR_BROWSER) {
+    if (distXz <= NEAR_BROWSER) {
       await this._setWalking(false);
       await this._delay(200);
       this._finish(id, 'inspect_browser', {
         arrived: true,
         alreadyClose: true,
+        nearMetric: 'xz',
+        distanceXz: Number(distXz.toFixed(2)),
         ...this.getSceneState(),
-        instruction: 'Look at the floating browser page in your vision and describe what you see.',
+        instruction:
+          'You are in first-person: describe only what is in front of your eyes on the floating browser. If the page is not visible, walk closer or turn toward it first.',
       });
       return;
     }
 
-    const travel = Math.max(0, dist - NEAR_BROWSER * 0.85);
+    const travel = Math.max(0, distXz - NEAR_BROWSER * 0.85);
     let seconds = travel / WALK_SPEED + 0.25;
     const argSec = Number(args.seconds);
     if (Number.isFinite(argSec)) seconds = Math.max(seconds, argSec);
     seconds = clamp(seconds, 1.5, MAX_WALK_SECONDS);
+
+    console.log(
+      `[Spatial] inspect_browser walking travel≈${travel.toFixed(2)}m xz duration=${seconds.toFixed(2)}s`,
+    );
 
     await this._setWalking(true);
     this._beginAction({
@@ -538,6 +726,7 @@ export class SpatialController {
       direction: 1,
       faceTarget: point.clone(),
       nearRadius: NEAR_BROWSER,
+      nearUseXz: true,
       targetName: 'browser',
       inspect: true,
     });
@@ -548,17 +737,44 @@ export class SpatialController {
     await this._setWalking(false);
     this._worldPos.set(0, 0, 0);
     this.yaw = 0;
+    if (isPhysicsReady()) setAvatarPosition(0, 0);
     this._syncRoots();
     const userPt = this._resolveTargetPoint('user');
     if (userPt) this._setLookAt(userPt, LOOK_HOLD_DEFAULT);
     this._finish(id, 'reset_pose', this.getSceneState());
   }
 
+  /**
+   * Apply desired walk XZ: Rapier capsule when ready, else soft floor clamp.
+   * @param {{ x: number, z: number }} desired
+   */
+  _applyWalkDesired(desired) {
+    if (isPhysicsReady()) {
+      const resolved = moveAvatarCapsule(desired);
+      this._worldPos.x = resolved.x;
+      this._worldPos.z = resolved.z;
+      this._worldPos.y = 0;
+      if (resolved.blocked) {
+        // Soft log only occasionally
+        if (!this._lastBlockedLog || this.elapsed - this._lastBlockedLog > 1.5) {
+          this._lastBlockedLog = this.elapsed;
+          console.log(
+            `[Spatial] Physics blocked walk near (${resolved.x.toFixed(2)}, ${resolved.z.toFixed(2)})`,
+          );
+        }
+      }
+      return;
+    }
+    this._worldPos.x = desired.x;
+    this._worldPos.z = desired.z;
+    this._clampToFloor(this._worldPos);
+  }
+
   // --- Action lifecycle ----------------------------------------------------
 
   _beginAction(action) {
     this.action = action;
-    console.log(`[Spatial] Action start ${action.kind} id=${action.id}`);
+
   }
 
   async _completeAction(extra = {}) {
@@ -584,7 +800,7 @@ export class SpatialController {
 
   _finish(id, name, result) {
     const payload = { ok: result.ok !== false, ...result };
-    console.log(`[Spatial] Done ${name}`, payload);
+
     this.opts.sendResult?.({
       type: 'spatialResult',
       id,

@@ -77,7 +77,11 @@ export class VoiceChanger {
   private ensureProcessor() {
     if (this.processor || this.destroyed) return;
     this.stderr = '';
-    console.log(`[VoiceChanger] Starting ffmpeg process with filter: ${this.profile.ffmpegFilter}`);
+    // Log once per process lifetime (reset() stops; next turn restarts — avoid spam)
+    if (!(this as any)._loggedStart) {
+      console.log(`[VoiceChanger] Starting ffmpeg process with filter: ${this.profile.ffmpegFilter}`);
+      (this as any)._loggedStart = true;
+    }
     const processor = spawn(this.ffmpegBinary, [
       '-hide_banner',
       '-loglevel', 'warning',

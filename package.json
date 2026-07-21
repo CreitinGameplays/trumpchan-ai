@@ -12,16 +12,19 @@
     "dev:electron": "concurrently -n vite,server,ai,electron \"npm run dev:vite\" \"npm run dev:server\" \"npm run dev:ai\" \"npm run electron:wait\"",
     "electron:wait": "wait-on tcp:5173 && electron .",
     "electron": "electron .",
+    "postinstall": "npx playwright install chromium",
     "build": "vite build",
     "preview": "vite preview"
   },
   "dependencies": {
+    "@dimforge/rapier3d-compat": "^0.19.3",
     "@google/genai": "^2.9.0",
     "@google/generative-ai": "^0.24.1",
     "@pixiv/three-vrm": "^3.4.2",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "playwright": "^1.61.1",
     "three": "^0.181.1",
     "ws": "^8.21.0"
   },
