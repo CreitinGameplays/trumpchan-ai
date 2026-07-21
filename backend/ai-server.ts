@@ -1210,6 +1210,7 @@ async function handleSpatialTool(functionCall: any) {
 
     try {
         // Normalize view_click x,y (accept pixel values > 1.5 as absolute coords)
+        // and mouse button for left/right/middle clicks.
         const normalizedArgs = { ...args };
         if (name === 'view_click' || name === 'view_look' || name === 'view_go') {
             if (normalizedArgs.x != null) {
@@ -1221,6 +1222,20 @@ async function handleSpatialTool(functionCall: any) {
                 let y = Number(normalizedArgs.y);
                 if (Number.isFinite(y) && y > 1.5) y = y / 1080;
                 if (Number.isFinite(y)) normalizedArgs.y = Math.max(0, Math.min(1, y));
+            }
+        }
+        if (name === 'view_click') {
+            const b = String(normalizedArgs.button || 'left').toLowerCase().trim();
+            if (b === 'right' || b === 'context' || b === 'contextmenu' || b === 'secondary' || b === '2') {
+                normalizedArgs.button = 'right';
+            } else if (b === 'middle' || b === 'aux' || b === 'auxiliary' || b === '1') {
+                normalizedArgs.button = 'middle';
+            } else {
+                normalizedArgs.button = 'left';
+            }
+            // Right/middle: single click only
+            if (normalizedArgs.button !== 'left') {
+                normalizedArgs.clickCount = 1;
             }
         }
 

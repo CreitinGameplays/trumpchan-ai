@@ -898,8 +898,16 @@ async function smartClick(opts = {}) {
   if (!(await ensureReady()) || !page) return { ok: false, error: 'no_browser' };
 
   const force = opts.force !== false;
-  const clickCount = Math.max(1, Math.min(3, Number(opts.clickCount) || 1));
-  const button = String(opts.button || 'left');
+  const rawBtn = String(opts.button || 'left').toLowerCase().trim();
+  const button =
+    rawBtn === 'right' || rawBtn === 'context' || rawBtn === 'contextmenu' || rawBtn === 'secondary'
+      ? 'right'
+      : rawBtn === 'middle' || rawBtn === 'aux' || rawBtn === 'auxiliary'
+        ? 'middle'
+        : 'left';
+  // Right/middle: always single click (no double context-menu spam)
+  const clickCount =
+    button === 'left' ? Math.max(1, Math.min(3, Number(opts.clickCount) || 1)) : 1;
   const hoverFirst = opts.hover === true || opts.hoverFirst === true || opts.hoverBefore === true;
   const label =
     (opts.text != null ? String(opts.text) : '') ||
@@ -908,8 +916,42 @@ async function smartClick(opts = {}) {
 
   let candidates = buildLocatorCandidates(opts);
   console.log(
-    `[BrowserService] PW click candidates=${candidates.length} ref=${opts.ref || '-'} label=${(label || '-').slice(0, 40)} force=${force} hover=${hoverFirst}`,
+    `[BrowserService] PW click candidates=${candidates.length} ref=${opts.ref || '-'} ` +
+      `label=${(label || '-').slice(0, 40)} button=${button} force=${force} hover=${hoverFirst}`,
   );
+
+  // Right/middle with normalized x,y: pure mouse path only (skip left-click force heuristics / DOM .click()).
+  if (button !== 'left' && opts.x != null && opts.y != null) {
+    try {
+      const nx = Number(opts.x);
+      const ny = Number(opts.y);
+      if (Number.isFinite(nx) && Number.isFinite(ny)) {
+        const px = nx <= 1.5 ? Math.round(nx * Math.max(BROWSER_W - 1, 1)) : Math.round(nx);
+        const py = ny <= 1.5 ? Math.round(ny * Math.max(BROWSER_H - 1, 1)) : Math.round(ny);
+        const cx = Math.max(0, Math.min(BROWSER_W - 1, px));
+        const cy = Math.max(0, Math.min(BROWSER_H - 1, py));
+        setCursorPosition(cx, cy, { force: true, phase: 'click' });
+        await page.mouse.move(cx, cy, { steps: 6 }).catch(() => {});
+        await page.mouse.click(cx, cy, { button: /** @type {any} */ (button), clickCount: 1 });
+        setCursorPosition(cx, cy, { force: true, phase: 'click' });
+        await sleep(150);
+        await captureOnce('after-click');
+        console.log(`[BrowserService] ${button}-click ok coords ${cx},${cy}`);
+        const ax = await captureAxSnapshot().catch(() => null);
+        return {
+          ok: true,
+          method: `mouse-${button}`,
+          button,
+          page: { x: cx / BROWSER_W, y: cy / BROWSER_H },
+          axTree: ax?.axTree || lastAxTree,
+          url: page.url(),
+          title: await page.title().catch(() => ''),
+        };
+      }
+    } catch (e) {
+      console.warn(`[BrowserService] ${button}-click coords failed:`, e?.message ?? e);
+    }
+  }
 
   if (candidates.length === 0) {
     const snap = await captureAxSnapshot().catch(() => null);

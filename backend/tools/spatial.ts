@@ -173,7 +173,7 @@ export const spatialToolDeclarations = [
       "Example: view_click({ x: 0.42, y: 0.61 }). Estimate from the yellow 0.0–1.0 rulers on the vision overlay. " +
       "Use browserBounds minX/maxX/minY/maxY and center from prior results so clicks land on the panel. " +
       "Rays hit browser page (Playwright), toolbar, or floor. Stand close with inspect_browser first. " +
-      "For double-click pass clickCount=2.",
+      "For double-click pass clickCount=2. For right-click / context menu pass button='right'.",
     behavior: Behavior.NON_BLOCKING,
     parameters: {
       type: Type.OBJECT,
@@ -206,7 +206,14 @@ export const spatialToolDeclarations = [
         },
         clickCount: {
           type: Type.NUMBER,
-          description: '1 = single click (default), 2 = double-click.',
+          description: '1 = single click (default), 2 = double-click (left only).',
+        },
+        button: {
+          type: Type.STRING,
+          enum: ['left', 'right', 'middle'],
+          description:
+            "Mouse button: 'left' (default primary click), 'right' (context menu / right-click), 'middle' (aux). " +
+            "Use button='right' when the user asks to right-click or open a context menu.",
         },
       },
     },

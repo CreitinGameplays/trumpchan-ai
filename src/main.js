@@ -2099,6 +2099,18 @@ function resolveViewRay(args = {}) {
 /**
  * AI tool: click what is under a view coordinate / grid cell.
  */
+/** Normalize Live tool button arg → Playwright 'left'|'right'|'middle'. */
+function normalizeMouseButton(raw) {
+  const s = String(raw || 'left').toLowerCase().trim();
+  if (s === 'right' || s === 'context' || s === 'contextmenu' || s === 'secondary' || s === '2') {
+    return 'right';
+  }
+  if (s === 'middle' || s === 'aux' || s === 'auxiliary' || s === '1') {
+    return 'middle';
+  }
+  return 'left';
+}
+
 async function handleViewClick(args = {}) {
   const resolved = resolveViewRay(args);
   if (!resolved.ok) return resolved;
@@ -2111,7 +2123,12 @@ async function handleViewClick(args = {}) {
     };
   }
 
-  // Browser page content → Playwright click
+  const button = normalizeMouseButton(args.button);
+  // Double-click only makes sense for left; force single for right/middle.
+  const clickCount =
+    button === 'left' && Number(args.clickCount) === 2 ? 2 : 1;
+
+  // Browser page content → Playwright click (left / right / middle)
   if (resolved.hit === 'browser' && resolved.page) {
     const bw = browserWindow;
     if (!bw) return { ok: false, error: 'no_browser', ...resolved };
@@ -2123,38 +2140,54 @@ async function handleViewClick(args = {}) {
         bw.setCursorNormalized(px, py, { phase: 'click', immediate: true });
       }
       let result;
-      if (typeof bw.sendClickSmart === 'function') {
+      // Right/middle: prefer pure mouse path (no left-click force-activate heuristics).
+      if (button !== 'left' && typeof bw.normalizedToContentPx === 'function' && typeof bw.sendMouseClick === 'function') {
+        const p = await bw.normalizedToContentPx(px, py);
+        console.log(`[ViewClick] ${button}-click page px=${p.x},${p.y} (norm ${px.toFixed(3)},${py.toFixed(3)})`);
+        result = await bw.sendMouseClick(p.x, p.y, { button, clickCount: 1 });
+      } else if (typeof bw.sendClickSmart === 'function') {
         result = await bw.sendClickSmart({
           x: px,
           y: py,
-          button: args.button || 'left',
-          clickCount: Number(args.clickCount) === 2 ? 2 : 1,
+          button,
+          clickCount,
           force: true,
         });
       } else if (typeof bw.normalizedToContentPx === 'function') {
         const p = await bw.normalizedToContentPx(px, py);
         result = await bw.sendMouseClick(p.x, p.y, {
-          button: args.button || 'left',
-          clickCount: Number(args.clickCount) === 2 ? 2 : 1,
+          button,
+          clickCount,
         });
       } else {
         result = { ok: false, error: 'no_click_api' };
       }
-      if (VISION_DEBUG) console.log('[ViewClick] Browser page click', { x: px, y: py }, 'ok=', result?.ok);
+      console.log(
+        `[ViewClick] Browser page ${button}-click x=${px.toFixed(3)} y=${py.toFixed(3)} ok=${result?.ok !== false}`,
+      );
       return {
         ok: result?.ok !== false,
-        action: 'browser_click',
+        action: button === 'right' ? 'browser_right_click' : button === 'middle' ? 'browser_middle_click' : 'browser_click',
+        button,
+        clickCount,
         ...resolved,
         page: { x: px, y: py },
         browserResult: {
           ok: result?.ok !== false,
           method: result?.method,
+          button,
           error: result?.error,
         },
       };
     } catch (e) {
       console.warn('[ViewClick] browser click failed:', e?.message ?? e);
-      return { ok: false, error: String(e?.message ?? e), action: 'browser_click', ...resolved };
+      return {
+        ok: false,
+        error: String(e?.message ?? e),
+        action: 'browser_click',
+        button,
+        ...resolved,
+      };
     }
   }
 

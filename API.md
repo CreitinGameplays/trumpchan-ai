@@ -415,15 +415,20 @@ AI vision JPEGs use high JPEG quality (~0.94) and a **numeric coordinate overlay
 
 | Tool | Args | Effect |
 |------|------|--------|
-| `view_click` | **`x`,`y`** 0–1 (preferred); legacy `cell` optional | Ray from FPV → browser page click, toolbar, or floor |
+| `view_click` | **`x`,`y`** 0–1 (preferred); optional `button` (`left`/`right`/`middle`), `clickCount` | Ray from FPV → browser page click, toolbar, or floor |
 | `view_look` | same | Face/look toward ray hit |
 | `view_go` | same | Walk to floor hit, or approach browser if panel hit |
 
-Example: `view_click({ x: 0.42, y: 0.61 })`. Pixel values (e.g. 0–1280) are accepted and normalized.
+Examples:
+- Left-click: `view_click({ x: 0.42, y: 0.61 })`
+- Right-click / context menu: `view_click({ x: 0.42, y: 0.61, button: "right" })`
+- Double-click: `view_click({ x: 0.42, y: 0.61, clickCount: 2 })`
 
-Implementation: overlay in `drawVisionGroundingGrid` (`src/main.js`); raycast in `resolveViewRay` / `handleViewClick`; tools in `backend/tools/spatial.ts`.
+Pixel values (e.g. 0–1280) are accepted and normalized.
 
-**Clicks:** `view_click` executes Live x,y directly. Gemini Live vision handles all spatial reasoning and click targeting natively.
+Implementation: overlay in `drawVisionGroundingGrid` (`src/main.js`); raycast in `resolveViewRay` / `handleViewClick`; Playwright `page.mouse.click({ button })` via `electron/browserService.js`; tools in `backend/tools/spatial.ts`.
+
+**Clicks:** `view_click` executes Live x,y directly with optional mouse button. Gemini Live vision handles all spatial reasoning and click targeting natively.
 
 **`browser_click` / `browser_dblclick` are deprecated** and removed from Live tool declarations. If the model still emits them, the AI server rejects with `deprecated_use_view_click`. Typing still uses `browser_type` + `ref=`.
 
