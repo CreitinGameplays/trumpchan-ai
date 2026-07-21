@@ -18,9 +18,7 @@ export const SPATIAL_TOOL_NAMES = [
   'view_click',
   'view_look',
   'view_go',
-  // Agentic click: flash-lite finds + clicks + verifies in a loop.
-  'click_target',
-  // Internal multi-step plan from VisionPlanner / flash-lite (or Live fallback).
+  // Internal multi-step plan from Live fallback.
   'run_plan',
 ] as const;
 
@@ -245,31 +243,7 @@ export const spatialToolDeclarations = [
       },
     },
   },
-  {
-    name: 'click_target',
-    description:
-      "PREFERRED for clicking UI elements. Describe WHAT you want to click (e.g. 'the Friends icon in the sidebar', " +
-      "'the Send button', 'the X close button'). An agentic vision helper will find the target on the screen, " +
-      "click it, verify it worked, and retry if needed — all automatically. " +
-      "Use this instead of view_click when you know WHAT to click but are unsure of exact coordinates. " +
-      "For double-click pass clickCount=2.",
-    behavior: Behavior.NON_BLOCKING,
-    parameters: {
-      type: Type.OBJECT,
-      properties: {
-        goal: {
-          type: Type.STRING,
-          description:
-            "REQUIRED: describe the click target, e.g. 'click the Friends icon', 'click the #general channel', 'click Accept on the friend request'.",
-        },
-        clickCount: {
-          type: Type.NUMBER,
-          description: '1 = single click (default), 2 = double-click.',
-        },
-      },
-      required: ['goal'],
-    },
-  },
+
 ];
 
 export type SpatialPending = {

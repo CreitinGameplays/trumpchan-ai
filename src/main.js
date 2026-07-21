@@ -79,7 +79,7 @@ scene.add(gazeTarget);
 const camera = new THREE.PerspectiveCamera(30, 1, 0.1, 100);
 camera.position.set(0, 1.4, 3.2);
 
-const controls = new OrbitControls({ camera, domElement: canvas });
+const controls = new OrbitControls(camera, canvas);
 controls.target.set(0, 1.2, 0);
 controls.enableDamping = true;
 controls.minDistance = 1.5;
@@ -95,7 +95,7 @@ controls.update();
 const VISION_WIDTH = 1920;
 const VISION_HEIGHT = 1080;
 const VISION_FPS = 1;
-/** Higher JPEG quality so small UI text + coordinate rulers stay readable for flash-lite. */
+/** Higher JPEG quality so small UI text + coordinate rulers stay readable for Gemini Live. */
 const VISION_JPEG_QUALITY = 0.95;
 /** Vertical FOV degrees. 58° + NEAR_BROWSER XZ ~1.35m ≈ readable panel when inspecting. */
 const VISION_FOV = 58;
@@ -896,7 +896,7 @@ function ensureSpatialController() {
     scene,
     idleUrl: defaultAnimationUrl,
     walkUrl: walkAnimationUrl,
-    /** VisionPlanner / run_plan can include view_click steps */
+    /** run_plan can include view_click steps */
     executeViewTool: async (name, args) => {
       if (name === 'view_click') return handleViewClick(args);
       if (name === 'view_look') return handleViewLook(args);

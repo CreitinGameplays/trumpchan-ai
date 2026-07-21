@@ -146,21 +146,19 @@ No animation assets are required for gestures; the `files/talking_animations/` c
 
 ## Spatial Navigation (Embodied Avatar)
 
-The avatar moves in the 3D room using a **two-layer brain**:
+The avatar moves in the 3D room using **Gemini Live vision** directly:
 
-1. **Primary — gemini-3.1-flash-lite VisionPlanner** (`backend/tools/robotics-planner.ts`): on spatial tools (`inspect_browser`, `walk_toward`, `walk`, and all `view_click` / `view_look` / `view_go`), the server sends the latest **FPV JPEG with coordinate rulers** + goal to `gemini-3.1-flash-lite` via `generateContent` (XINJIANYA / aihub). Returns a short JSON plan. Robotics-ER is no longer used (rate limits).
-2. **Fallback — Live tool args**: if ER is disabled, errors, or returns no steps, the original Live function-call args are executed as a one-step plan.
-3. **Executor — Live path** (`src/spatialController.js`): always runs the plan (look / turn / walk). Not replaced by ER — ER only *plans*.
+1. **Gemini Live** decides when to call spatial tools based on what it sees in the FPV stream.
+2. **Executor** (`src/spatialController.js`): runs the dispatched tool (look / turn / walk).
 
-Tools are declared in `backend/tools/spatial.ts`. Env: `XINJIANYA_KEY` (or `GEMINI_API_KEY`), optional `VISION_PLANNER_BASE_URL` / `XINJIANYA_BASE_URL` (default `https://aihub.071129.xyz`), `VISION_PLANNER_MODEL` (default `gemini-3.1-flash-lite`), `VISION_PLANNER_ENABLED=0` (or legacy `ROBOTICS_ER_ENABLED=0`) to force Live fallback-only.
+Tools are declared in `backend/tools/spatial.ts`.
 
 ### Flow
 
 1. Live model calls e.g. `inspect_browser`.
-2. Server asks VisionPlanner (`gemini-3.1-flash-lite`) for a plan from the latest FPV frame (or falls back).
-3. Server dispatches `{ type: "spatialCommand", name: "run_plan", steps: [...] }`.
-4. Frontend runs steps serially; replies `{ type: "spatialResult", ... }` with pose.
-5. Server sends tool response with **`WHEN_IDLE`** so the Live model can speak about what it sees.
+2. Server dispatches `{ type: "spatialCommand", name: "run_plan", steps: [...] }`.
+3. Frontend runs steps serially; replies `{ type: "spatialResult", ... }` with pose.
+4. Server sends tool response with **`WHEN_IDLE`** so the Live model can speak about what it sees.
 
 ### Tools (model → server)
 
@@ -197,7 +195,7 @@ Floor radius ≈ 4.2 m. Walk uses `files/Walking.fbx` via the gesture controller
 
 ## Browser control (in-scene offscreen browser)
 
-The AI operates a floating browser via tools in `backend/tools/browser.ts`. Multi-step goals use a vision planner (`backend/tools/browser-planner.ts`) with **Live tool-arg fallback**.
+The AI operates a floating browser via tools in `backend/tools/browser.ts`. Gemini Live vision handles all browser reasoning directly.
 
 **Architecture (Electron + Playwright Chromium):** main process launches **Playwright Chromium** with a **persistent user profile** (`launchPersistentContext` → `userData/playwright-browser-profile`). Cookies, localStorage, and logins survive app restarts. JPEG screenshots stream to the renderer (`preload.cjs` → `browser:paint`) and paint a **WebGL texture plane**. There is **no `<webview>`**. Profile is never wiped on close.
 
@@ -262,7 +260,7 @@ Do not rely on bare coordinates for modal buttons.
 
 **`browserCommand`** (server → frontend):
 ```json
-{ "type": "browserCommand", "id": "…", "name": "run_plan", "args": { "steps": […], "originalName": "use_browser", "planner": "browser-er" } }
+{ "type": "browserCommand", "id": "…", "name": "run_plan", "args": { "steps": […], "originalName": "use_browser", "planner": "live" } }
 ```
 
 **`browserResult`** (frontend → server):
@@ -270,14 +268,7 @@ Do not rely on bare coordinates for modal buttons.
 { "type": "browserResult", "id": "…", "name": "use_browser", "result": { "ok": true, "url": "…", "title": "…", "stepsRun": ["browser_navigate","browser_click"] } }
 ```
 
-**`browserVisionFrame`** (optional, frontend → server): high-res crop of browser content for planning cache only (does not auto-chat).
-
 Tool responses use **`WHEN_IDLE`** so the Live model can speak after acting. Page navigation alone never starts a turn.
-
-### Env
-
-- Shares `XINJIANYA_KEY` / `GEMINI_API_KEY` and optional `VISION_PLANNER_BASE_URL` with the spatial VisionPlanner (`gemini-3.1-flash-lite`).
-- `BROWSER_ER_MODEL`, `BROWSER_ER_BASE_URL`, `BROWSER_ER_ENABLED=0` to force Live fallback only.
 
 ### 3D mouse cursor
 
@@ -432,7 +423,7 @@ Example: `view_click({ x: 0.42, y: 0.61 })`. Pixel values (e.g. 0–1280) are ac
 
 Implementation: overlay in `drawVisionGroundingGrid` (`src/main.js`); raycast in `resolveViewRay` / `handleViewClick`; tools in `backend/tools/spatial.ts`.
 
-**Clicks:** by default `view_click` **executes Live’s x,y** without flash-lite re-aim (`VISION_PLANNER_CLICK_REFINE=1` re-enables planner refine). Flash-lite still plans walk/inspect. Live aim is kept because the planner often invents wrong Discord rows. Fallback: Live tool args if planner fails.
+**Clicks:** `view_click` executes Live x,y directly. Gemini Live vision handles all spatial reasoning and click targeting natively.
 
 **`browser_click` / `browser_dblclick` are deprecated** and removed from Live tool declarations. If the model still emits them, the AI server rejects with `deprecated_use_view_click`. Typing still uses `browser_type` + `ref=`.
 
@@ -446,7 +437,7 @@ The avatar has always-on vision in **first-person**: Gemini Live sees the 3D wor
 
 1. **Capture (renderer, `src/main.js`)** — Each frame the FPV camera is placed in **world space** at the eyes (`VRMLookAt.getLookAtWorldPosition`, fallback head bone) aiming at the browser center when in front, else body yaw. Renders into **1280×720** offscreen RT at ~1 FPS, FOV **`VISION_FOV` (58°)**. Spatial stop for the browser uses **floor XZ distance** (`NEAR_BROWSER` ≈ **1.35 m** → eye–panel ≈1.4–1.5 m, ~75–80% frame fill; 0.75 m was too close and clipped the panel). Full RT viewport/scissor. Avatar mesh hidden; floating browser **WebGL content plane** included (`prepareForVisionCapture`). CSS3D toolbar is **not** in FPV (DOM-only). JPEG → `visionFrame` (`source: "avatar-first-person"`).
 2. **Transport** — Renderer → hub (`ws://localhost:3000`) → AI server (`visionFrame` with `ts` + monotonic `seq`).
-3. **Forward (`backend/ai-server.ts`)** — **Always caches the newest frame**; only *sends* to Live at ~1 FPS. Mid-interval frames update the cache and schedule a deferred flush of the latest picture (never leave Gemini on an older frame). Stale out-of-order `seq`/`ts` are dropped. Browser crops (`browserVisionFrame`) are planner-only and do not replace FPV Live video.
+3. **Forward (`backend/ai-server.ts`)** — **Always caches the newest frame**; only *sends* to Live at ~1 FPS. Mid-interval frames update the cache and schedule a deferred flush of the latest picture (never leave Gemini on an older frame). Stale out-of-order `seq`/`ts` are dropped.
 
 ### Manual POV screenshot (debug)
 

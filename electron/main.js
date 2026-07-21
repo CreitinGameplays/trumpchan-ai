@@ -72,7 +72,11 @@ function createWindow() {
 
   win.webContents.on('console-message', (event) => {
     const tag = ['log', 'warn', 'error'][event.level] || 'log';
-    console.log(`[Renderer:${tag}] ${event.message}`);
+    const loc =
+      event.sourceId && event.line
+        ? ` (${event.sourceId}:${event.line})`
+        : '';
+    console.log(`[Renderer:${tag}] ${event.message}${loc}`);
   });
 
   win.webContents.once('did-finish-load', () => {

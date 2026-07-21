@@ -13,27 +13,11 @@ import {
     spatialToolResponse,
 } from './tools/spatial.js';
 import {
-    RoboticsSpatialPlanner,
-    shouldUseRoboticsPlanner,
-    isViewSpatialTool,
-    mergeViewToolPlan,
-    ensureInspectPlan,
-    fallbackPlanFromTool,
-    type SpatialStep,
-} from './tools/robotics-planner.js';
-import { ClickAgent, type ClickAttempt, type ClickAgentResult } from './tools/click-agent.js';
-import {
     browserToolDeclarations,
     isBrowserTool,
     BrowserToolBridge,
     browserToolResponse,
 } from './tools/browser.js';
-import {
-    BrowserActionPlanner,
-    shouldUseBrowserPlanner,
-    fallbackBrowserPlanFromTool,
-    type BrowserStep,
-} from './tools/browser-planner.js';
 
 // Load environment variables
 dotenv.config();
@@ -111,11 +95,11 @@ let geminiModel = '';
 let geminiSysInstruction = '';
 
 // Vision: always keep the newest frame; only throttle *sends* to Live (~1 FPS).
-// Previously we dropped mid-throttle frames entirely, so planners/Live could lag.
+// Previously we dropped mid-throttle frames entirely, so Live could lag.
 let lastVisionSentAt = 0;
 let visionFrameCount = 0;
 let visionRecvCount = 0;
-// Latest JPEG for VisionPlanner / browser planners + Live (base64, no data: prefix).
+// Latest JPEG for Live (base64, no data: prefix).
 let lastVisionJpeg: string | null = null;
 let lastVisionMime = 'image/jpeg';
 let lastVisionMeta = { width: 0, height: 0, ts: 0, seq: 0 };
@@ -123,14 +107,6 @@ let lastVisionMeta = { width: 0, height: 0, ts: 0, seq: 0 };
 let lastVisionSentClientTs = 0;
 let visionFlushTimer: ReturnType<typeof setTimeout> | null = null;
 const VISION_MIN_SEND_MS = 900;
-
-const roboticsPlanner = new RoboticsSpatialPlanner();
-const clickAgent = new ClickAgent();
-const browserPlanner = new BrowserActionPlanner();
-// Optional higher-res crop of the in-scene browser (from Electron / frontend).
-let lastBrowserJpeg: string | null = null;
-let lastBrowserMime = 'image/jpeg';
-let lastBrowserTs = 0;
 
 /**
  * Always store the newest FPV frame. Schedule a Live send of whatever is latest
@@ -833,7 +809,7 @@ function buildLiveConfig(): any {
         // Gemini 3.x Live uses thinkingLevel (not thinkingBudget).
         // This keeps latency low while still allowing tool use smartly.
         thinkingConfig: {
-            thinkingLevel: ThinkingLevel.MEDIUM, // reasoning enabled makes the model rarely hallucinate tool calls
+            thinkingLevel: ThinkingLevel.HIGH, // reasoning enabled makes the model rarely hallucinate tool calls
         },
         // HIGH so the model can read more detail from the 3D scene / in-scene
         // browser (text, UI). Costs more tokens per frame than MEDIUM.
@@ -1157,18 +1133,6 @@ async function startAiServer() {
                 onToolPipelineMaybeIdle('browser-result');
             }
 
-            // High-res crop of the floating browser content (for browser planner only).
-            // Never replaces FPV as Live video — that would show a stale non-head view.
-            else if (cmd.type === 'browserVisionFrame' && cmd.data) {
-                lastBrowserJpeg = String(cmd.data);
-                lastBrowserMime = cmd.mimeType || 'image/jpeg';
-                lastBrowserTs = Number(cmd.ts) || Date.now();
-                console.log(
-                    `[BROWSER-VISION] Cached browser crop ${cmd.width || '?'}x${cmd.height || '?'} ` +
-                        `ts=${lastBrowserTs} (planner only; Live stays on newest FPV)`,
-                );
-            }
-
             // NOTE: Browser interactions (page loads / navigation) must NOT
             // trigger the AI. We deliberately do not accept chat-like grounding
             // for navigation events. Scene pose is passive context only.
@@ -1223,7 +1187,7 @@ function handleSetEmotion(functionCall: any) {
 function dispatchSpatialPlan(
     toolCallId: string,
     originalName: string,
-    steps: SpatialStep[],
+    steps: Array<{ name: string; args: Record<string, unknown> }>,
     meta: Record<string, unknown>,
 ): boolean {
     return spatialBridge.dispatch(toolCallId, 'run_plan', {
@@ -1233,402 +1197,62 @@ function dispatchSpatialPlan(
     });
 }
 
-async function handleSpatialToolWithPlanner(functionCall: any) {
+/**
+ * Dispatch spatial tool directly to the visualizer using Live tool args (no external planner).
+ * Gemini Live vision handles all spatial reasoning natively.
+ */
+async function handleSpatialTool(functionCall: any) {
     const name = String(functionCall.name);
     const args = (functionCall.args ?? {}) as Record<string, unknown>;
     const id = String(functionCall.id);
 
-    // Mark busy while planning so steers queue (logs showed spatial=0 during 5s plan)
     toolsBusy = true;
 
     try {
-        // Fast path: look/turn/stop/reset never need planner. view_* + walk/inspect try flash-lite first.
-        if (!shouldUseRoboticsPlanner(name) || !lastVisionJpeg || !roboticsPlanner.isAvailable()) {
-            const plan = fallbackPlanFromTool(name, args);
-            const ok = dispatchSpatialPlan(id, name, plan.steps, {
-                planner: plan.source,
-                reasoning:
-                    plan.reasoning ||
-                    (isViewSpatialTool(name)
-                        ? 'Live view tool (VisionPlanner / flash-lite unavailable).'
-                        : undefined),
-            });
-            if (!ok) {
-                if (isViewSpatialTool(name)) {
-                    const direct = spatialBridge.dispatch(id, name, args);
-                    if (!direct) {
-                        sendToolResult(id, name, { ok: false, error: 'visualizer_offline' }, 'when_idle');
-                        onToolPipelineMaybeIdle('spatial-offline');
-                    } else {
-                        console.log(
-                            `[SPATIAL] Direct ${name} (plan dispatch failed)`,
-                            JSON.stringify(args).slice(0, 160),
-                        );
-                    }
-                    return;
-                }
+        // Normalize view_click x,y (accept pixel values > 1.5 as absolute coords)
+        const normalizedArgs = { ...args };
+        if (name === 'view_click' || name === 'view_look' || name === 'view_go') {
+            if (normalizedArgs.x != null) {
+                let x = Number(normalizedArgs.x);
+                if (Number.isFinite(x) && x > 1.5) x = x / 1920;
+                if (Number.isFinite(x)) normalizedArgs.x = Math.max(0, Math.min(1, x));
+            }
+            if (normalizedArgs.y != null) {
+                let y = Number(normalizedArgs.y);
+                if (Number.isFinite(y) && y > 1.5) y = y / 1080;
+                if (Number.isFinite(y)) normalizedArgs.y = Math.max(0, Math.min(1, y));
+            }
+        }
+
+        // Flush newest FPV so Live vision stays current after the tool executes.
+        flushNewestVisionToLive('pre-spatial');
+        console.log(`[SPATIAL] Dispatching ${name} (Live-only)`, JSON.stringify(normalizedArgs).slice(0, 200));
+
+        // Dispatch as a single-step plan so the frontend run_plan executor handles it uniformly.
+        const ok = dispatchSpatialPlan(id, name, [{ name, args: normalizedArgs }], {
+            planner: 'live',
+            reasoning: 'Direct Live tool dispatch (Gemini Live vision).',
+        });
+        if (!ok) {
+            // Fallback: try direct dispatch without run_plan wrapper
+            const direct = spatialBridge.dispatch(id, name, normalizedArgs);
+            if (!direct) {
                 sendToolResult(id, name, { ok: false, error: 'visualizer_offline' }, 'when_idle');
                 onToolPipelineMaybeIdle('spatial-offline');
             }
-            return;
-        }
-
-        // view_click with Live x,y: skip planner refine of aim (still allow direct execute).
-        // Optional short path — faster + avoids flash-lite inventing wrong Discord rows.
-        const liveX = Number(args.x);
-        const liveY = Number(args.y);
-        const liveHasXY =
-            isViewSpatialTool(name) &&
-            Number.isFinite(liveX) &&
-            Number.isFinite(liveY) &&
-            liveX >= 0 &&
-            liveX <= 1.5 &&
-            liveY >= 0 &&
-            liveY <= 1.5;
-
-        if (name === 'view_click' && liveHasXY && process.env.VISION_PLANNER_CLICK_REFINE !== '1') {
-            // Default: trust Live aim; planner invents wrong targets too often on Discord.
-            flushNewestVisionToLive('pre-view-click');
-            console.log(
-                `[SPATIAL] view_click Live aim x=${liveX} y=${liveY} (planner refine off; set VISION_PLANNER_CLICK_REFINE=1 to enable)`,
-            );
-            const ok = dispatchSpatialPlan(
-                id,
-                name,
-                [{ name, args: { ...args, x: liveX > 1.5 ? liveX / 1920 : liveX, y: liveY > 1.5 ? liveY / 1080 : liveY } }],
-                {
-                    planner: 'live-aim',
-                    reasoning: 'Execute Live x,y without flash-lite re-aim (Discord mis-click fix).',
-                },
-            );
-            if (!ok) {
-                spatialBridge.dispatch(id, name, args);
-            }
-            return;
-        }
-
-        const goal = isViewSpatialTool(name)
-            ? name === 'view_click'
-                ? `CLICK at Live coordinates (KEEP THESE unless clearly off-panel): ${JSON.stringify(args)}. ` +
-                  `x,y are 0–1 FPV ((0,0)=top-left). Do not invent a different button/channel. ` +
-                  `If panel is small/far, inspect_browser first then view_click with the SAME x,y.`
-                : name === 'view_look'
-                  ? `Look toward Live point: ${JSON.stringify(args)}. Keep x,y if present.`
-                  : `Walk toward Live point: ${JSON.stringify(args)}.`
-            : name === 'inspect_browser'
-              ? 'MUST approach the floating browser: use inspect_browser (or walk_toward browser + look_at browser). Do NOT only look_at if still far.'
-              : name === 'walk_toward'
-                ? `Walk toward ${String(args.target || 'browser')}.`
-                : name === 'walk'
-                  ? `Walk ${String(args.direction || 'forward')} for a short step.`
-                  : `Execute spatial action ${name} with args ${JSON.stringify(args)}`;
-
-        flushNewestVisionToLive('pre-spatial-plan');
-        console.log(
-            `[SPATIAL] VisionPlanner (flash-lite) for ${name}… ` +
-                `fpvSeq=${lastVisionMeta.seq} ageMs=${lastVisionMeta.ts ? Date.now() - lastVisionMeta.ts : '?'} ` +
-                `${lastVisionMeta.width}x${lastVisionMeta.height}`,
-        );
-        const plan = await roboticsPlanner.planFromFrame({
-            jpegBase64: lastVisionJpeg,
-            mimeType: lastVisionMime,
-            goal,
-            sceneHint: `frame ${lastVisionMeta.width}x${lastVisionMeta.height} seq=${lastVisionMeta.seq}; live tool was ${name} args=${JSON.stringify(args).slice(0, 200)}`,
-        });
-
-        let steps: SpatialStep[];
-        if (isViewSpatialTool(name)) {
-            steps = mergeViewToolPlan(name, args, plan);
-            if (!plan.ok) {
-                console.warn(
-                    `[SPATIAL] VisionPlanner failed for ${name} (${plan.error}); Live x,y fallback.`,
-                );
-            } else {
-                console.log(
-                    `[SPATIAL] VisionPlanner plan ${name}: steps=${steps.map((s) => s.name).join('→')} ` +
-                        `lastArgs=${JSON.stringify(steps[steps.length - 1]?.args || {}).slice(0, 160)}`,
-                );
-            }
-        } else {
-            steps =
-                plan.ok && plan.steps.length > 0
-                    ? plan.steps
-                    : fallbackPlanFromTool(name, args).steps;
-            steps = ensureInspectPlan(steps, name);
-            if (!plan.ok) {
-                console.warn(
-                    `[SPATIAL] VisionPlanner failed (${plan.error}); Live tool fallback for ${name}.`,
-                );
-            }
-        }
-
-        const ok = dispatchSpatialPlan(id, name, steps, {
-            planner: plan.ok ? plan.source || 'flash-lite' : 'fallback',
-            reasoning: plan.reasoning,
-            plannerError: plan.error,
-            plannerLatencyMs: plan.latencyMs,
-            plannerModel: plan.model,
-        });
-        if (!ok) {
-            if (isViewSpatialTool(name)) {
-                const direct = spatialBridge.dispatch(id, name, args);
-                if (direct) {
-                    console.warn(`[SPATIAL] run_plan offline; direct ${name}`);
-                    return;
-                }
-            }
-            sendToolResult(id, name, { ok: false, error: 'visualizer_offline' }, 'when_idle');
-            onToolPipelineMaybeIdle('spatial-offline');
-        }
-    } finally {
-        // Bridge pending keeps toolsInFlight true after dispatch; if we never dispatched, clear.
-        if (!spatialBridge.hasPending() && !browserBridge.hasPending()) {
-            toolsBusy = false;
-            onToolPipelineMaybeIdle('spatial-plan-end');
-        }
-    }
-}
-
-/**
- * Agentic click loop: flash-lite finds the target, clicks, verifies, retries.
- * No max-attempt cap — loops until flash-lite says "done" or system error.
- */
-async function handleClickTarget(functionCall: any) {
-    const id = String(functionCall.id);
-    const args = (functionCall.args ?? {}) as Record<string, unknown>;
-    const goal = String(args.goal || '').trim();
-    const clickCount = Number(args.clickCount) === 2 ? 2 : 1;
-    const started = Date.now();
-    const attempts: ClickAttempt[] = [];
-
-    if (!goal) {
-        sendToolResult(id, 'click_target', { ok: false, error: 'missing_goal' }, 'when_idle');
-        onToolPipelineMaybeIdle('click-target-no-goal');
-        return;
-    }
-
-    if (!clickAgent.isAvailable()) {
-        // Fallback: tell Live to use view_click manually
-        sendToolResult(id, 'click_target', {
-            ok: false,
-            error: 'click_agent_unavailable',
-            goal,
-        }, 'when_idle');
-        onToolPipelineMaybeIdle('click-target-unavailable');
-        return;
-    }
-
-    console.log(`[CLICK_TARGET] Starting agentic loop goal="${goal.slice(0, 120)}"`);
-    toolsBusy = true;
-
-    try {
-        // Helper: wait for fresh FPV frame (up to 3s)
-        const waitForFreshFrame = async (afterTs: number): Promise<string | null> => {
-            const deadline = Date.now() + 3000;
-            while (Date.now() < deadline) {
-                if (lastVisionMeta.ts > afterTs && lastVisionJpeg) {
-                    return lastVisionJpeg;
-                }
-                await new Promise((r) => setTimeout(r, 200));
-            }
-            return lastVisionJpeg; // use whatever we have
-        };
-
-        // Dispatch view_click directly to frontend WS and listen for result.
-        const executeClickDirect = (x: number, y: number): Promise<Record<string, unknown>> => {
-            return new Promise((resolve) => {
-                const clickId = `ct_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-
-                if (!aiWsClient || aiWsClient.readyState !== 1) {
-                    resolve({ ok: false, error: 'visualizer_offline' });
-                    return;
-                }
-
-                const timer = setTimeout(() => {
-                    cleanup();
-                    resolve({ ok: false, error: 'click_timeout' });
-                }, 25000);
-
-                const handler = (data: any) => {
-                    try {
-                        const msg = JSON.parse(data.toString());
-                        if (msg.type === 'spatialResult' && msg.id === clickId) {
-                            cleanup();
-                            resolve(msg.result || { ok: true });
-                        }
-                    } catch { /* ignore parse errors */ }
-                };
-
-                const cleanup = () => {
-                    clearTimeout(timer);
-                    aiWsClient?.off?.('message', handler);
-                };
-
-                aiWsClient.on('message', handler);
-
-                aiWsClient.send(JSON.stringify({
-                    type: 'spatialCommand',
-                    id: clickId,
-                    name: 'view_click',
-                    args: { x, y, clickCount },
-                }));
-            });
-        };
-
-        // --- Main agentic loop ---
-        const MAX_CLICK_ATTEMPTS = 8;
-        let done = false;
-        while (!done) {
-            // Safety cap: prevent infinite loop
-            if (attempts.length >= MAX_CLICK_ATTEMPTS) {
-                console.warn(`[CLICK_TARGET] Max attempts (${MAX_CLICK_ATTEMPTS}) reached for goal="${goal.slice(0, 80)}"`);
-                sendToolResult(id, 'click_target', {
-                    ok: false,
-                    done: false,
-                    goal,
-                    attempts,
-                    totalMs: Date.now() - started,
-                    error: `max_attempts_reached (${MAX_CLICK_ATTEMPTS})`,
-                } as any, 'when_idle');
-                onToolPipelineMaybeIdle('click-target-max-attempts');
-                return;
-            }
-
-            // 1. Get current FPV
-            const preTs = lastVisionMeta.ts;
-            const frame = lastVisionJpeg;
-            if (!frame) {
-                console.warn('[CLICK_TARGET] No FPV frame available');
-                await new Promise((r) => setTimeout(r, 1000));
-                continue;
-            }
-
-            // 2. Ask flash-lite where to click
-            console.log(`[CLICK_TARGET] Asking flash-lite (attempt ${attempts.length + 1}) goal="${goal.slice(0, 80)}"`);
-            let plan;
-            try {
-                plan = await clickAgent.planClick({
-                    jpegBase64: frame,
-                    goal,
-                    attemptHistory: attempts,
-                });
-            } catch (e: any) {
-                console.error('[CLICK_TARGET] planClick error:', e?.message);
-                await new Promise((r) => setTimeout(r, 2000));
-                continue;
-            }
-
-            console.log(`[CLICK_TARGET] Plan: status=${plan.status} x=${plan.x} y=${plan.y} reason="${plan.reasoning}"`);
-
-            if (plan.status === 'done') {
-                done = true;
-                const result: ClickAgentResult = {
-                    ok: true,
-                    done: true,
-                    goal,
-                    attempts,
-                    totalMs: Date.now() - started,
-                    finalReasoning: plan.reasoning,
-                };
-                sendToolResult(id, 'click_target', result as any, 'when_idle');
-                onToolPipelineMaybeIdle('click-target-done');
-                console.log(`[CLICK_TARGET] Done in ${attempts.length} attempts, ${result.totalMs}ms: ${plan.reasoning}`);
-                return;
-            }
-
-            if (plan.status === 'need_approach') {
-                // Run inspect_browser to get closer
-                console.log('[CLICK_TARGET] Need approach — running inspect_browser');
-                const approachId = `ct_approach_${Date.now()}`;
-                dispatchSpatialPlan(approachId, 'inspect_browser', [
-                    { name: 'inspect_browser', args: { seconds: 3 } },
-                ], { planner: 'click-agent', reasoning: 'Approaching browser for click_target' });
-                // Wait for approach to complete
-                await new Promise((r) => setTimeout(r, 4000));
-                // Wait for fresh frame after approach
-                await waitForFreshFrame(preTs);
-                continue;
-            }
-
-            // status === 'click'
-            if (plan.x == null || plan.y == null) {
-                console.warn('[CLICK_TARGET] Plan returned click but no x,y');
-                continue;
-            }
-
-            // 3. Execute the click
-            const attempt: ClickAttempt = {
-                x: plan.x,
-                y: plan.y,
-                reasoning: plan.reasoning,
-            };
-
-            const clickResult = await executeClickDirect(plan.x, plan.y);
-            attempt.result = {
-                ok: clickResult.ok !== false,
-                hit: String(clickResult.hit || 'unknown'),
-                page: clickResult.page as any,
-                error: clickResult.error ? String(clickResult.error) : undefined,
-            };
-            attempts.push(attempt);
-            console.log(`[CLICK_TARGET] Click #${attempts.length} x=${plan.x} y=${plan.y} → ${attempt.result.ok ? 'ok' : attempt.result.error}`);
-
-            // 4. Wait for post-click frame
-            await new Promise((r) => setTimeout(r, 800));
-            const postFrame = await waitForFreshFrame(preTs);
-            if (!postFrame) continue;
-
-            // 5. Verify
-            let verify;
-            try {
-                verify = await clickAgent.verifyClick({
-                    jpegBase64: postFrame,
-                    goal,
-                    prevX: plan.x,
-                    prevY: plan.y,
-                    prevReason: plan.reasoning,
-                });
-            } catch (e: any) {
-                console.warn('[CLICK_TARGET] Verify error:', e?.message);
-                continue; // will retry on next loop
-            }
-
-            console.log(`[CLICK_TARGET] Verify: status=${verify.status} reason="${verify.reasoning}"`);
-
-            if (verify.status === 'done') {
-                done = true;
-                const result: ClickAgentResult = {
-                    ok: true,
-                    done: true,
-                    goal,
-                    attempts,
-                    totalMs: Date.now() - started,
-                    finalReasoning: verify.reasoning,
-                };
-                sendToolResult(id, 'click_target', result as any, 'when_idle');
-                onToolPipelineMaybeIdle('click-target-done');
-                console.log(`[CLICK_TARGET] Verified done in ${attempts.length} attempts, ${result.totalMs}ms`);
-                return;
-            }
-
-            // retry — loop continues; flash-lite will see attempt history next round
-            if (verify.x != null && verify.y != null) {
-                // Use verify's suggested new coords as a hint for next planClick
-                console.log(`[CLICK_TARGET] Verify suggests retry at x=${verify.x} y=${verify.y}`);
-            }
         }
     } finally {
         if (!spatialBridge.hasPending() && !browserBridge.hasPending()) {
             toolsBusy = false;
-            onToolPipelineMaybeIdle('click-target-end');
+            onToolPipelineMaybeIdle('spatial-end');
         }
     }
 }
 
-function dispatchBrowserPlan(
+function dispatchBrowserStep(
     toolCallId: string,
     originalName: string,
-    steps: BrowserStep[],
+    steps: Array<{ name: string; args: Record<string, unknown> }>,
     meta: Record<string, unknown>,
 ): boolean {
     return browserBridge.dispatch(toolCallId, 'run_plan', {
@@ -1638,26 +1262,11 @@ function dispatchBrowserPlan(
     });
 }
 
-/** Prefer newest available picture for planners (browser crop only if not stale). */
-function newestPlannerFrame(): { jpeg: string | null; mime: string; label: string } {
-    const visionAge = lastVisionMeta.ts ? Date.now() - lastVisionMeta.ts : Infinity;
-    const browserAge = lastBrowserTs ? Date.now() - lastBrowserTs : Infinity;
-    // Browser crop wins only if fresher than FPV (and < 5s old).
-    if (
-        lastBrowserJpeg &&
-        lastBrowserTs > 0 &&
-        browserAge < 5000 &&
-        (browserAge <= visionAge || !lastVisionJpeg)
-    ) {
-        return { jpeg: lastBrowserJpeg, mime: lastBrowserMime, label: 'browser-crop' };
-    }
-    if (lastVisionJpeg) {
-        return { jpeg: lastVisionJpeg, mime: lastVisionMime, label: 'fpv-latest' };
-    }
-    return { jpeg: lastBrowserJpeg, mime: lastBrowserMime, label: 'browser-fallback' };
-}
-
-async function handleBrowserToolWithPlanner(functionCall: any) {
+/**
+ * Dispatch browser tool directly using Live tool args (no external planner).
+ * use_browser goals get a simple fallback (navigate/search/snapshot).
+ */
+async function handleBrowserTool(functionCall: any) {
     const name = String(functionCall.name);
     const args = (functionCall.args ?? {}) as Record<string, unknown>;
     const id = String(functionCall.id);
@@ -1686,19 +1295,30 @@ async function handleBrowserToolWithPlanner(functionCall: any) {
         return;
     }
 
-    // Multi-step vision plan for use_browser; other tools = one-step Live fallback.
-    const wantPlan = shouldUseBrowserPlanner(name);
-    // Ensure Live + planners see the absolute latest cached FPV before planning.
-    flushNewestVisionToLive('pre-browser-plan');
-    const pick = newestPlannerFrame();
-    const jpeg = pick.jpeg;
-    const mime = pick.mime;
+    flushNewestVisionToLive('pre-browser');
 
-    if (!wantPlan || !jpeg || !browserPlanner.isAvailable()) {
-        const plan = fallbackBrowserPlanFromTool(name, args);
-        const ok = dispatchBrowserPlan(id, name, plan.steps, {
-            planner: plan.source,
-            reasoning: plan.reasoning,
+    // use_browser: build a simple fallback plan from the goal.
+    if (name === 'use_browser') {
+        const goal = String(args.goal || '').trim();
+        let steps: Array<{ name: string; args: Record<string, unknown> }>;
+
+        if (/^https?:\/\//i.test(goal) || /^[^\s]+\.[^\s]+$/.test(goal)) {
+            steps = [{ name: 'browser_navigate', args: { url: goal } }];
+        } else if (goal && /\b(type|click|press|enter|scroll|select|check|uncheck|toggle|dismiss|close|fill|send|submit|tap|hover)\b/i.test(goal)) {
+            steps = [{ name: 'browser_snapshot', args: { includeElements: true } }];
+        } else if (goal) {
+            steps = [
+                { name: 'browser_navigate', args: { query: goal } },
+                { name: 'browser_snapshot', args: { includeElements: true } },
+            ];
+        } else {
+            steps = [{ name: 'browser_snapshot', args: {} }];
+        }
+
+        console.log(`[BROWSER] use_browser Live fallback: steps=${steps.map(s => s.name).join('→')}`);
+        const ok = dispatchBrowserStep(id, name, steps, {
+            planner: 'live',
+            reasoning: 'Direct Live fallback for use_browser.',
         });
         if (!ok) {
             sendToolResult(id, name, { ok: false, error: 'visualizer_offline' }, 'when_idle');
@@ -1707,37 +1327,11 @@ async function handleBrowserToolWithPlanner(functionCall: any) {
         return;
     }
 
-    const goal =
-        name === 'use_browser'
-            ? String(args.goal || 'Interact with the browser page.')
-            : `Execute ${name} with args ${JSON.stringify(args)}`;
-
-    console.log(
-        `[BROWSER] Vision planner for ${name} using ${pick.label} ` +
-            `(fpvAge=${lastVisionMeta.ts ? Date.now() - lastVisionMeta.ts : '?'}ms ` +
-            `browserAge=${lastBrowserTs ? Date.now() - lastBrowserTs : '?'}ms)`,
-    );
-    const plan = await browserPlanner.planFromFrame({
-        jpegBase64: jpeg,
-        mimeType: mime,
-        goal,
-        pageHint: `live tool=${name}; source=${pick.label}; frame ${lastVisionMeta.width}x${lastVisionMeta.height}`,
-    });
-
-    const steps =
-        plan.ok && plan.steps.length > 0
-            ? plan.steps
-            : fallbackBrowserPlanFromTool(name, args).steps;
-
-    if (!plan.ok) {
-        console.warn(`[BROWSER] Planner failed (${plan.error}); Live fallback for ${name}.`);
-    }
-
-    const ok = dispatchBrowserPlan(id, name, steps, {
-        planner: plan.ok ? 'browser-er' : 'fallback',
-        reasoning: plan.reasoning,
-        erError: plan.error,
-        erLatencyMs: plan.latencyMs,
+    // All other browser tools: dispatch as single-step plan.
+    console.log(`[BROWSER] Dispatching ${name} (Live-only)`, JSON.stringify(args).slice(0, 200));
+    const ok = dispatchBrowserStep(id, name, [{ name, args: args ?? {} }], {
+        planner: 'live',
+        reasoning: 'Direct Live browser tool dispatch.',
     });
     if (!ok) {
         sendToolResult(id, name, { ok: false, error: 'visualizer_offline' }, 'when_idle');
@@ -1854,28 +1448,10 @@ function handleToolCalls(functionCalls: any[]) {
         }
 
         if (isSpatialTool(functionCall.name)) {
-            // click_target → agentic loop (separate handler)
-            if (functionCall.name === 'click_target') {
-                anyAsyncTool = true;
-                markToolsBusyFromToolCall();
-                handleClickTarget(functionCall).catch((e) => {
-                    console.error('[CLICK_TARGET] Error:', e);
-                    sendToolResult(
-                        String(functionCall.id),
-                        'click_target',
-                        { ok: false, error: String(e?.message ?? e) },
-                        'when_idle',
-                    );
-                    onToolPipelineMaybeIdle('click-target-error');
-                });
-                continue;
-            }
-
             anyAsyncTool = true;
             markToolsBusyFromToolCall();
-            // Fire-and-forget async planner+dispatch (does not block other tools).
-            handleSpatialToolWithPlanner(functionCall).catch((e) => {
-                console.error('[SPATIAL] Planner dispatch error:', e);
+            handleSpatialTool(functionCall).catch((e) => {
+                console.error('[SPATIAL] Dispatch error:', e);
                 sendToolResult(
                     String(functionCall.id),
                     String(functionCall.name),
@@ -1890,8 +1466,8 @@ function handleToolCalls(functionCalls: any[]) {
         if (isBrowserTool(functionCall.name) || functionCall.name === 'use_browser') {
             anyAsyncTool = true;
             markToolsBusyFromToolCall();
-            handleBrowserToolWithPlanner(functionCall).catch((e) => {
-                console.error('[BROWSER] Planner dispatch error:', e);
+            handleBrowserTool(functionCall).catch((e) => {
+                console.error('[BROWSER] Dispatch error:', e);
                 sendToolResult(
                     String(functionCall.id),
                     String(functionCall.name),
