@@ -106,12 +106,12 @@ function sanitizeSteps(raw: unknown): SpatialStep[] {
     if (isViewSpatialTool(name)) {
       if (args.x != null) {
         let x = Number(args.x);
-        if (Number.isFinite(x) && x > 1.5) x = x / 1280;
+        if (Number.isFinite(x) && x > 1.5) x = x / 1920;
         if (Number.isFinite(x)) args.x = Math.max(0, Math.min(1, x));
       }
       if (args.y != null) {
         let y = Number(args.y);
-        if (Number.isFinite(y) && y > 1.5) y = y / 720;
+        if (Number.isFinite(y) && y > 1.5) y = y / 1080;
         if (Number.isFinite(y)) args.y = Math.max(0, Math.min(1, y));
       }
     }
@@ -303,7 +303,7 @@ export function isViewSpatialTool(name: string): boolean {
 function num01(v: unknown): number | null {
   let n = Number(v);
   if (!Number.isFinite(n)) return null;
-  if (n > 1.5) n = n / 1280;
+  if (n > 1.5) n = n / 1920;
   return Math.max(0, Math.min(1, n));
 }
 

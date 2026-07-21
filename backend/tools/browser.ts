@@ -456,6 +456,18 @@ export const BROWSER_MAX_PENDING = 4;
 /** Per-tool wait; queue runs serially so deep queues need headroom. */
 export const BROWSER_TOOL_TIMEOUT_MS = 90000;
 
+/**
+ * Mutating tools that should be serialized (max 1 in-flight at a time).
+ * Multiple concurrent browser_type or browser_navigate calls cause race conditions.
+ */
+const MUTATING_BROWSER_TOOLS = new Set([
+  'browser_type',
+  'browser_navigate',
+  'browser_key',
+  'browser_check',
+  'browser_select',
+]);
+
 export class BrowserToolBridge {
   private pending = new Map<string, BrowserPending>();
   private readonly timeoutMs: number;
@@ -469,6 +481,28 @@ export class BrowserToolBridge {
   ) {
     this.timeoutMs = timeoutMs;
     this.maxPending = maxPending;
+  }
+
+  /**
+   * Check if a mutating browser tool is already in-flight.
+   * Used by the AI server to reject/deduplicate concurrent destructive actions.
+   */
+  hasMutatingPending(): boolean {
+    for (const entry of this.pending.values()) {
+      // The dispatched name is 'run_plan' but the real tool name is in the original args
+      // We track the original tool name on the entry
+      if (MUTATING_BROWSER_TOOLS.has(entry.name)) return true;
+    }
+    return false;
+  }
+
+  /** Get the original tool name of what's currently pending (for logging). */
+  getMutatingPendingNames(): string[] {
+    const names: string[] = [];
+    for (const entry of this.pending.values()) {
+      if (MUTATING_BROWSER_TOOLS.has(entry.name)) names.push(entry.name);
+    }
+    return names;
   }
 
   dispatch(id: string, name: string, args: Record<string, unknown>): boolean {
@@ -510,7 +544,9 @@ export class BrowserToolBridge {
       });
     }, this.timeoutMs);
 
-    this.pending.set(id, { id, name, timer });
+    // Store original tool name (from plan originalName or args) for mutex tracking
+    const originalName = String(args.originalName || name);
+    this.pending.set(id, { id, name: originalName, timer });
 
     ws.send(
       JSON.stringify({

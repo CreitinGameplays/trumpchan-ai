@@ -313,6 +313,12 @@ async function captureOnce(reason) {
       lastCaptureFailLogAt = t;
       console.warn(`[BrowserService] captureOnce(${reason}):`, msg.slice(0, 120));
     }
+    // Retry once for important captures (after-nav, after-load) with longer timeout
+    if (important && !reason.endsWith('-retry')) {
+      setTimeout(() => {
+        captureOnce(reason + '-retry').catch(() => {});
+      }, 2000);
+    }
   } finally {
     const done = releaseCapture;
     captureInFlight = null;
@@ -1678,6 +1684,8 @@ function resolveEditableLocator(opts = {}) {
   }
 
   // Heuristic: visible chat/search composers
+  // NOTE: Only match elements that are actually editable (input, textarea, [contenteditable], [role=textbox], div).
+  // Do NOT match <a>, <button>, <span> etc. with aria-label*="message" — those are links/nav items.
   try {
     const chat = page
       .locator(
@@ -1690,15 +1698,20 @@ function resolveEditableLocator(opts = {}) {
           'input:not([type])',
           'input[type="email"]',
           'div[role="textbox"]',
-          '[data-testid*="message" i]',
-          '[data-testid*="composer" i]',
-          '[data-testid*="chat" i]',
-          '[aria-label*="message" i]',
-          '[aria-label*="Message" i]',
-          '[placeholder*="message" i]',
-          '[placeholder*="Message" i]',
-          '[placeholder*="Search" i]',
-          '[placeholder*="Type" i]',
+          'div[data-testid*="message" i]',
+          'div[data-testid*="composer" i]',
+          'div[data-testid*="chat" i]',
+          'div[aria-label*="message" i][contenteditable="true"]',
+          'div[aria-label*="message" i][role="textbox"]',
+          'textarea[aria-label*="message" i]',
+          'input[aria-label*="message" i]',
+          '[contenteditable="true"][placeholder*="message" i]',
+          'textarea[placeholder*="message" i]',
+          'input[placeholder*="message" i]',
+          '[contenteditable="true"][placeholder*="Search" i]',
+          'input[placeholder*="Search" i]',
+          '[contenteditable="true"][placeholder*="Type" i]',
+          'input[placeholder*="Type" i]',
         ].join(', '),
       )
       .filter({ hasNot: page.locator('[disabled], [aria-disabled="true"]') })

@@ -553,6 +553,16 @@ function looksLikeCancelSteer(text: string): boolean {
 }
 
 /**
+ * Detect urgent user corrections that should interrupt in-flight tools and be
+ * injected immediately (not queued). These are complaints/redirections about
+ * current AI behavior that need immediate attention.
+ */
+function looksLikeUrgentCorrection(text: string): boolean {
+    const t = normalizeUserText(text);
+    return /\b(too ?(much|many)|stop (sending|typing|doing)|enough|wrong|not that|quit it|chill|calm down|dont|don't do that)\b/.test(t);
+}
+
+/**
  * User text for Live realtime input only — never tool errors, policy, or click hints.
  * Light framing so mid-task steers are not treated as a brand-new session topic.
  */
@@ -642,10 +652,17 @@ function acceptUserChatText(rawText: string, source: 'chat' | 'mic' = 'chat'): {
         cancelBrowserWorkForSteer('user_cancel_steer');
     }
 
+    // Urgent corrections (e.g. "too much messages", "stop sending") also cancel
+    // in-flight browser work and bypass the queue so the model hears it NOW.
+    const isUrgent = looksLikeUrgentCorrection(text);
+    if (isUrgent && (browserBridge.hasPending() || toolsBusy)) {
+        cancelBrowserWorkForSteer('user_urgent_correction');
+    }
+
     // Tools running → queue (Codex Tab-like default). Do not inject mid-tool so we
     // don't spawn a parallel "start browsing again" loop while run_plan is open.
-    // Cancel messages still inject ASAP after cancel so the model can stop talking about retries.
-    if (toolsInFlight() && !looksLikeCancelSteer(text)) {
+    // Cancel messages and urgent corrections still inject ASAP so the model can stop.
+    if (toolsInFlight() && !looksLikeCancelSteer(text) && !isUrgent) {
         // Cap queue: newest wins if full (drop oldest)
         while (steerQueue.length >= MAX_STEER_QUEUE) {
             const dropped = steerQueue.shift();
@@ -1278,7 +1295,7 @@ async function handleSpatialToolWithPlanner(functionCall: any) {
             const ok = dispatchSpatialPlan(
                 id,
                 name,
-                [{ name, args: { ...args, x: liveX > 1.5 ? liveX / 1280 : liveX, y: liveY > 1.5 ? liveY / 720 : liveY } }],
+                [{ name, args: { ...args, x: liveX > 1.5 ? liveX / 1920 : liveX, y: liveY > 1.5 ? liveY / 1080 : liveY } }],
                 {
                     planner: 'live-aim',
                     reasoning: 'Execute Live x,y without flash-lite re-aim (Discord mis-click fix).',
@@ -1459,8 +1476,24 @@ async function handleClickTarget(functionCall: any) {
         };
 
         // --- Main agentic loop ---
+        const MAX_CLICK_ATTEMPTS = 8;
         let done = false;
         while (!done) {
+            // Safety cap: prevent infinite loop
+            if (attempts.length >= MAX_CLICK_ATTEMPTS) {
+                console.warn(`[CLICK_TARGET] Max attempts (${MAX_CLICK_ATTEMPTS}) reached for goal="${goal.slice(0, 80)}"`);
+                sendToolResult(id, 'click_target', {
+                    ok: false,
+                    done: false,
+                    goal,
+                    attempts,
+                    totalMs: Date.now() - started,
+                    error: `max_attempts_reached (${MAX_CLICK_ATTEMPTS})`,
+                } as any, 'when_idle');
+                onToolPipelineMaybeIdle('click-target-max-attempts');
+                return;
+            }
+
             // 1. Get current FPV
             const preTs = lastVisionMeta.ts;
             const frame = lastVisionJpeg;
@@ -1629,6 +1662,30 @@ async function handleBrowserToolWithPlanner(functionCall: any) {
     const args = (functionCall.args ?? {}) as Record<string, unknown>;
     const id = String(functionCall.id);
 
+    // Dedup: reject duplicate browser_type with same text within short window.
+    if (name === 'browser_type' && isBrowserTypeDuplicate(args)) {
+        sendToolResult(id, name, { ok: true, deduplicated: true, reason: 'same text already sent recently' }, 'when_idle');
+        onToolPipelineMaybeIdle('browser-type-dedup');
+        return;
+    }
+
+    // Mutex: reject mutating browser tools if one is already in-flight (prevents concurrent type/navigate races).
+    const MUTATING_TOOLS = ['browser_type', 'browser_navigate', 'browser_key', 'browser_check', 'browser_select'];
+    if (MUTATING_TOOLS.includes(name) && browserBridge.hasMutatingPending()) {
+        const inFlight = browserBridge.getMutatingPendingNames();
+        console.warn(
+            `[BROWSER] Mutex: rejecting ${name} id=${id} — mutating tool already in-flight: ${inFlight.join(', ')}`,
+        );
+        sendToolResult(id, name, {
+            ok: false,
+            error: 'mutating_tool_in_flight',
+            inFlight,
+            reason: 'Another browser input action is already running. Wait for it to complete.',
+        }, 'when_idle');
+        onToolPipelineMaybeIdle('browser-mutex');
+        return;
+    }
+
     // Multi-step vision plan for use_browser; other tools = one-step Live fallback.
     const wantPlan = shouldUseBrowserPlanner(name);
     // Ensure Live + planners see the absolute latest cached FPV before planning.
@@ -1691,6 +1748,50 @@ async function handleBrowserToolWithPlanner(functionCall: any) {
 /** Deduplicate tool call ids within a short window (Live sometimes redelivers). */
 const recentToolCallIds = new Set<string>();
 const RECENT_TOOL_ID_TTL_MS = 60000;
+
+// ---------------------------------------------------------------------------
+// browser_type deduplication: prevent the same text from being typed multiple
+// times within a short window (Gemini Live often emits duplicate tool calls).
+// ---------------------------------------------------------------------------
+type RecentBrowserType = { text: string; pressEnter: boolean; at: number };
+const recentBrowserTypes: RecentBrowserType[] = [];
+const BROWSER_TYPE_DEDUPE_WINDOW_MS = 8000;
+const BROWSER_TYPE_RATE_LIMIT_MS = 3000; // min gap between any browser_type dispatches
+
+let lastBrowserTypeDispatchAt = 0;
+
+function isBrowserTypeDuplicate(args: Record<string, unknown>): boolean {
+    const text = String(args.text || '').trim();
+    if (!text) return false;
+    const pressEnter = Boolean(args.pressEnter || args.enter || args.submit);
+    const now = Date.now();
+
+    // Expire old entries
+    while (recentBrowserTypes.length && now - recentBrowserTypes[0].at > BROWSER_TYPE_DEDUPE_WINDOW_MS) {
+        recentBrowserTypes.shift();
+    }
+
+    // Check for duplicate text+enter combo
+    const isDupe = recentBrowserTypes.some(
+        (r) => r.text === text && r.pressEnter === pressEnter,
+    );
+    if (isDupe) {
+        console.warn(`[BROWSER] Deduplicated browser_type: "${text.slice(0, 60)}" (already sent within ${BROWSER_TYPE_DEDUPE_WINDOW_MS}ms)`);
+        return true;
+    }
+
+    // Rate limit: too fast between any browser_type
+    if (now - lastBrowserTypeDispatchAt < BROWSER_TYPE_RATE_LIMIT_MS) {
+        console.warn(`[BROWSER] Rate-limited browser_type: "${text.slice(0, 60)}" (${now - lastBrowserTypeDispatchAt}ms since last)`);
+        return true;
+    }
+
+    // Record
+    recentBrowserTypes.push({ text, pressEnter, at: now });
+    if (recentBrowserTypes.length > 20) recentBrowserTypes.shift();
+    lastBrowserTypeDispatchAt = now;
+    return false;
+}
 
 function claimToolCallId(id: string): boolean {
     if (!id) return true;

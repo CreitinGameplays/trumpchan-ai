@@ -79,7 +79,7 @@ scene.add(gazeTarget);
 const camera = new THREE.PerspectiveCamera(30, 1, 0.1, 100);
 camera.position.set(0, 1.4, 3.2);
 
-const controls = new OrbitControls(camera, canvas);
+const controls = new OrbitControls({ camera, domElement: canvas });
 controls.target.set(0, 1.2, 0);
 controls.enableDamping = true;
 controls.minDistance = 1.5;
@@ -92,11 +92,11 @@ controls.update();
 // ---------------------------------------------------------------------------
 // FPV for Gemini. FOV near human (~55–65°). Wider (92°) made panels look distant;
 // slightly tighter than 65° so a ~0.9m eye–panel stand fills most of the frame.
-const VISION_WIDTH = 1280;
-const VISION_HEIGHT = 720;
+const VISION_WIDTH = 1920;
+const VISION_HEIGHT = 1080;
 const VISION_FPS = 1;
-/** Higher JPEG quality so small UI text + dense grid labels stay readable for Live. */
-const VISION_JPEG_QUALITY = 0.94;
+/** Higher JPEG quality so small UI text + coordinate rulers stay readable for flash-lite. */
+const VISION_JPEG_QUALITY = 0.95;
 /** Vertical FOV degrees. 58° + NEAR_BROWSER XZ ~1.35m ≈ readable panel when inspecting. */
 const VISION_FOV = 58;
 /**
@@ -199,7 +199,7 @@ try {
     if (!ok) return;
     syncBrowserPanelPhysics();
     setAvatarPosition(0, 0);
-    console.log('[Physics]', getPhysicsDebugInfo());
+    console.log('[Physics]', JSON.stringify(getPhysicsDebugInfo()));
   });
 } catch (e) {
   console.error('[Main] createBrowserWindow failed:', e);
@@ -1756,7 +1756,7 @@ function parseVisionCell(cell, opts = {}) {
 
 /**
  * Normalize view coord to 0–1.
- * Accepts 0–1 floats, or pixel values (e.g. 0–1280 / 0–720) when > 1.5.
+ * Accepts 0–1 floats, or pixel values (e.g. 0–1920 / 0–1080) when > 1.5.
  */
 function clamp01View(v, axis = 'x') {
   let n = Number(v);

@@ -247,6 +247,13 @@ export function shouldUseBrowserPlanner(toolName: string): boolean {
   return toolName === 'use_browser';
 }
 
+/** Detect if a use_browser goal is an on-page action (type/click/scroll) vs a search/navigate. */
+function goalIsOnPageAction(goal: string): boolean {
+  const lower = goal.toLowerCase();
+  // Action verbs that indicate interacting with the current page, not navigating away
+  return /\b(type|click|press|enter|scroll|select|check|uncheck|toggle|dismiss|close|fill|send|submit|tap|hover)\b/.test(lower);
+}
+
 /** Simple tools: execute as a one-step plan (Live args). */
 export function fallbackBrowserPlanFromTool(
   name: string,
@@ -261,6 +268,19 @@ export function fallbackBrowserPlanFromTool(
         source: 'fallback',
         steps: [{ name: 'browser_navigate', args: { url: goal } }],
         reasoning: 'Fallback: treat goal as URL.',
+      };
+    }
+    // If goal describes an on-page action, do NOT navigate away — snapshot instead
+    // so the model can use the current page context.
+    if (goal && goalIsOnPageAction(goal)) {
+      console.warn(
+        `[BrowserER] Fallback: goal is on-page action, NOT navigating away: "${goal.slice(0, 100)}"`,
+      );
+      return {
+        ok: true,
+        source: 'fallback',
+        steps: [{ name: 'browser_snapshot', args: { includeElements: true } }],
+        reasoning: 'Fallback: goal is an on-page action; snapshot current page (no navigation).',
       };
     }
     if (goal) {

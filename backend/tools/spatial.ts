@@ -183,12 +183,12 @@ export const spatialToolDeclarations = [
         x: {
           type: Type.NUMBER,
           description:
-            'REQUIRED preferred: horizontal position 0–1 across the FPV image (0=left, 0.5=center, 1=right). May also pass pixels 0–1280.',
+            'REQUIRED preferred: horizontal position 0–1 across the FPV image (0=left, 0.5=center, 1=right). May also pass pixels 0–1920.',
         },
         y: {
           type: Type.NUMBER,
           description:
-            'REQUIRED preferred: vertical position 0–1 across the FPV image (0=top, 0.5=middle, 1=bottom). May also pass pixels 0–720.',
+            'REQUIRED preferred: vertical position 0–1 across the FPV image (0=top, 0.5=middle, 1=bottom). May also pass pixels 0–1080.',
         },
         cell: {
           type: Type.STRING,

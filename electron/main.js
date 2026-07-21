@@ -1,4 +1,4 @@
-import { app, BrowserWindow } from 'electron';
+import { app, BrowserWindow, session } from 'electron';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
@@ -43,6 +43,17 @@ function createWindow() {
     console.log('[Electron] Loading dev server:', DEV_SERVER_URL);
     win.loadURL(DEV_SERVER_URL).catch((e) => console.error('[Electron] loadURL failed:', e));
   } else {
+    // Set CSP for production builds to suppress security warnings
+    session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+      callback({
+        responseHeaders: {
+          ...details.responseHeaders,
+          'Content-Security-Policy': [
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' ws://localhost:* http://localhost:*; media-src 'self' blob:; worker-src 'self' blob:;",
+          ],
+        },
+      });
+    });
     const indexPath = path.join(__dirname, '..', 'dist', 'index.html');
     console.log('[Electron] Loading built file:', indexPath);
     win.loadFile(indexPath).catch((e) => console.error('[Electron] loadFile failed:', e));
@@ -59,9 +70,9 @@ function createWindow() {
     console.error('[Electron] Failed to load:', code, desc, url);
   });
 
-  win.webContents.on('console-message', (_e, level, message, line, sourceId) => {
-    const tag = ['log', 'warn', 'error'][level] || 'log';
-    console.log(`[Renderer:${tag}] ${message}`);
+  win.webContents.on('console-message', (event) => {
+    const tag = ['log', 'warn', 'error'][event.level] || 'log';
+    console.log(`[Renderer:${tag}] ${event.message}`);
   });
 
   win.webContents.once('did-finish-load', () => {
