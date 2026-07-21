@@ -18,6 +18,8 @@ export const SPATIAL_TOOL_NAMES = [
   'view_click',
   'view_look',
   'view_go',
+  // Agentic click: flash-lite finds + clicks + verifies in a loop.
+  'click_target',
   // Internal multi-step plan from VisionPlanner / flash-lite (or Live fallback).
   'run_plan',
 ] as const;
@@ -168,13 +170,12 @@ export const spatialToolDeclarations = [
     name: 'view_click',
     description:
       "PRIMARY AND ONLY way to click in the 3D world and on the floating browser page. " +
-      "Do NOT use browser_click (deprecated). " +
-      "PREFERRED: pass numeric image coordinates x,y in 0–1 over the full first-person frame " +
+      "Pass numeric image coordinates x,y in 0–1 over the full first-person frame " +
       "((0,0)=top-left, (1,0)=top-right, (0,1)=bottom-left, (1,1)=bottom-right). " +
       "Example: view_click({ x: 0.42, y: 0.61 }). Estimate from the yellow 0.0–1.0 rulers on the vision overlay. " +
       "Use browserBounds minX/maxX/minY/maxY and center from prior results so clicks land on the panel. " +
-      "Optional legacy: cell='H6' if you must. Rays hit browser page (Playwright), toolbar, or floor. " +
-      "Stand close with inspect_browser first. For double-click pass clickCount=2.",
+      "Rays hit browser page (Playwright), toolbar, or floor. Stand close with inspect_browser first. " +
+      "For double-click pass clickCount=2.",
     behavior: Behavior.NON_BLOCKING,
     parameters: {
       type: Type.OBJECT,
@@ -244,6 +245,31 @@ export const spatialToolDeclarations = [
       },
     },
   },
+  {
+    name: 'click_target',
+    description:
+      "PREFERRED for clicking UI elements. Describe WHAT you want to click (e.g. 'the Friends icon in the sidebar', " +
+      "'the Send button', 'the X close button'). An agentic vision helper will find the target on the screen, " +
+      "click it, verify it worked, and retry if needed — all automatically. " +
+      "Use this instead of view_click when you know WHAT to click but are unsure of exact coordinates. " +
+      "For double-click pass clickCount=2.",
+    behavior: Behavior.NON_BLOCKING,
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        goal: {
+          type: Type.STRING,
+          description:
+            "REQUIRED: describe the click target, e.g. 'click the Friends icon', 'click the #general channel', 'click Accept on the friend request'.",
+        },
+        clickCount: {
+          type: Type.NUMBER,
+          description: '1 = single click (default), 2 = double-click.',
+        },
+      },
+      required: ['goal'],
+    },
+  },
 ];
 
 export type SpatialPending = {
@@ -295,7 +321,6 @@ export class SpatialToolBridge {
       this.onTimeoutResult(id, name, {
         ok: false,
         error: 'timeout',
-        message: 'Movement timed out; assume you stayed roughly where you were.',
       });
     }, waitMs);
 

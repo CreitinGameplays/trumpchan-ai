@@ -1078,8 +1078,7 @@ async function smartClick(opts = {}) {
     return {
       ok: false,
       error: 'click_timeout_all_strategies',
-      message:
-        'Could not find/click target. If it only appears on hover: browser_hover the parent (⋯/More), then browser_click the item. Or pass hover=true on the parent first.',
+
       label,
       tried: candidates.map((c) => c.method),
       axTree: ax?.axTree || lastAxTree,
@@ -1631,11 +1630,7 @@ async function smartCheck(opts = {}) {
     elements: ax?.elements?.slice?.(0, 40),
     url: page.url(),
     title: await page.title().catch(() => lastTitle),
-    instruction: ok
-      ? captchaHint
-        ? `Captcha/checkbox interaction done (method=${method}). If a challenge grid appeared, use vision + browser_click on tiles, then re-check.`
-        : `Checkbox is now ${finalChecked ? 'checked' : 'unchecked'}.`
-      : 'State may not have changed — try browser_snapshot and click the control ref, pass x,y for captcha boxes, or checked=true/false explicitly.',
+    checked: finalChecked,
   };
 }
 
@@ -2623,12 +2618,7 @@ async function smartScroll(opts = {}) {
       y: ny,
       ref: opts.ref,
     },
-    instruction:
-      jsResult?.method === 'js-no-move'
-        ? 'No scroll movement — try x,y over the specific pane (e.g. sidebar 0.15,0.5 or chat 0.5,0.7), or pages=1, or mode=bottom.'
-        : jsResult?.panes?.length > 1
-          ? `Multiple scroll panes (${jsResult.panes.length}). Use browser_scroll with x,y focused on the pane you want (left sidebar ~x=0.15, main ~x=0.6).`
-          : undefined,
+    moved: jsResult?.method !== 'js-no-move',
   };
 }
 
@@ -2757,8 +2747,6 @@ async function smartHover(opts = {}) {
     modalBlocking: ax?.modalBlocking,
     url: page.url(),
     title: await page.title().catch(() => lastTitle),
-    instruction:
-      'Hover held. Click revealed menu items now with browser_click({ text: "Delete Message" }). If still missing, browser_hover with clickToOpen=true on the ⋯ button first.',
   };
 }
 
@@ -2966,9 +2954,6 @@ async function smartDismiss(opts = {}) {
     closeRefs: after?.closeRefs || [],
     axTree: after?.axTree || lastAxTree,
     elements: after?.elements?.slice?.(0, 40),
-    instruction: still
-      ? 'Modal may remain. Click a [CLOSE] ref or browser_dismiss again.'
-      : 'Overlay cleared if present. Use fresh refs.',
   };
 }
 

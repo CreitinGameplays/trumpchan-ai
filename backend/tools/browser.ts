@@ -1,8 +1,7 @@
 /**
  * In-scene browser control tools (navigate, type, scroll, keys, read).
  *
- * CLICKS: use spatial tool view_click ({x,y} 0–1 on FPV) only — browser_click is
- * deprecated for the Live model (still accepted internally if a plan emits it).
+ * CLICKS: spatial tool view_click ({x,y} 0–1 on FPV) only.
  * Typing/scroll/snapshot still use ref= / labels.
  */
 import { Type, Behavior, FunctionResponseScheduling } from '@google/genai';
@@ -488,8 +487,6 @@ export class BrowserToolBridge {
       this.onTimeoutResult(id, name, {
         ok: false,
         error: 'queue_full',
-        message:
-          'Too many browser actions already running. Wait for results, then continue with ONE multi-step plan (not parallel clicks).',
         pendingCount: this.pending.size,
       });
       return true;
@@ -510,8 +507,6 @@ export class BrowserToolBridge {
       this.onTimeoutResult(id, name, {
         ok: false,
         error: 'timeout',
-        message:
-          'Browser action timed out. Prefer navigate/type tools + view_click for clicks; avoid parallel tool storms.',
       });
     }, this.timeoutMs);
 
@@ -572,7 +567,6 @@ export class BrowserToolBridge {
       this.onTimeoutResult(entry.id, entry.name, {
         ok: false,
         error: 'cancelled',
-        message: `Browser work cancelled (${reason}). Stop retrying clicks unless the user asks again.`,
       });
     }
     console.log(`[BROWSER] cancelAll reason=${reason} n=${entries.length}`);

@@ -21,6 +21,7 @@ import {
     fallbackPlanFromTool,
     type SpatialStep,
 } from './tools/robotics-planner.js';
+import { ClickAgent, type ClickAttempt, type ClickAgentResult } from './tools/click-agent.js';
 import {
     browserToolDeclarations,
     isBrowserTool,
@@ -124,6 +125,7 @@ let visionFlushTimer: ReturnType<typeof setTimeout> | null = null;
 const VISION_MIN_SEND_MS = 900;
 
 const roboticsPlanner = new RoboticsSpatialPlanner();
+const clickAgent = new ClickAgent();
 const browserPlanner = new BrowserActionPlanner();
 // Optional higher-res crop of the in-scene browser (from Electron / frontend).
 let lastBrowserJpeg: string | null = null;
@@ -314,13 +316,8 @@ function sendToolResult(
     try {
         // Closed-loop vision: push newest FPV before the model reads the tool result.
         flushNewestVisionToLive(`pre-tool-result:${name}`);
-        // Strip huge fields before sending to Live (elements keep; no base64 dumps).
+        // Facts only — never inject coaching / tool-error prose into the Live tool channel.
         const safe = sanitizeToolResultPayload(response);
-        // Ensure hybrid grounding fields survive even if caller omitted them.
-        if (!safe.reobserve) {
-            safe.reobserve =
-                'Use your newest first-person frame + this result before the next claim or tool.';
-        }
         const fr =
             mode === 'when_idle'
                 ? isBrowserTool(name)
@@ -334,14 +331,40 @@ function sendToolResult(
     }
 }
 
+/**
+ * Tool results must be factual state only.
+ * Strip instructional / policy / deprecation prose so it never reaches Live
+ * (and is never mistaken for user input).
+ */
 function sanitizeToolResultPayload(response: Record<string, unknown>): Record<string, unknown> {
     const out: Record<string, unknown> = { ...response };
     // Never send multi-MB crops into the tool response.
     delete out.cropData;
     delete out.jpeg;
     delete out.data;
+    // Coaching / policy fields (not observations)
+    delete out.instruction;
+    delete out.reobserve;
+    delete out.prefer;
+    delete out.hint;
+    delete out.message;
+    if (out.error != null && typeof out.error !== 'string') {
+        out.error = String(out.error);
+    }
+    // Keep short machine error codes; drop long human coaching messages on errors
+    if (typeof out.error === 'string' && out.error.length > 80) {
+        out.error = out.error.slice(0, 80);
+    }
+    if (out.grounding && typeof out.grounding === 'object' && !Array.isArray(out.grounding)) {
+        const g = { ...(out.grounding as Record<string, unknown>) };
+        delete g.prefer;
+        delete g.rules;
+        delete g.reobserve;
+        delete g.instruction;
+        delete g.hint;
+        out.grounding = g;
+    }
     if (Array.isArray(out.elements) && out.elements.length > 24) {
-        // Keep compact SoM-style list for grounding (ref + role + label).
         out.elements = out.elements.slice(0, 24).map((el: any) => ({
             ref: el?.ref,
             role: el?.role,
@@ -484,10 +507,11 @@ function replayLastUserMessageIfNeeded(reason: string) {
             for (let i = recentUserNorms.length - 1; i >= 0; i--) {
                 if (recentUserNorms[i].norm === norm) recentUserNorms.splice(i, 1);
             }
+            // Replay user text only — no tool-policy / error coaching in the user channel.
             const payload =
-                `[SYSTEM — Live session was reset (${why}). ` +
-                `You lost in-progress tool state. Continue helping the user from this last request. ` +
-                `Do not apologize at length; act.]\n${text}`;
+                why === '1007_invalid_argument' || why === 'reconnect' || why === 'session_not_ready'
+                    ? `[User (after reconnect)] ${text}`
+                    : text;
             session.sendRealtimeInput({ text: payload });
             rememberUserText(norm);
             flushNewestVisionToLive('post-reconnect-replay');
@@ -528,24 +552,17 @@ function looksLikeCancelSteer(text: string): boolean {
     );
 }
 
+/**
+ * User text for Live realtime input only — never tool errors, policy, or click hints.
+ * Light framing so mid-task steers are not treated as a brand-new session topic.
+ */
 function buildSteerPayload(userText: string): string {
-    const cancel = looksLikeCancelSteer(userText);
-    if (cancel) {
-        return (
-            `[STEER — CANCEL / STOP current browser and spatial work. ` +
-            `Acknowledge briefly, do NOT retry clicks, captchas, or navigation unless the user starts a new request. ` +
-            `User said:]\n${userText}`
-        );
+    const t = String(userText || '').trim();
+    if (!t) return t;
+    if (looksLikeCancelSteer(t)) {
+        return `[User (cancel)] ${t}`;
     }
-    // Explicit framing so Live treats this as course-correction, not a new task.
-    return (
-        `[STEER — mid-task guidance from the user. ` +
-        `Continue the work you were already doing (including any open tool plan). ` +
-        `Do NOT restart from scratch, re-run the same browser/spatial plan, or ignore progress ` +
-        `unless the user clearly asks to cancel or change goals. ` +
-        `Clicks only via view_click (FPV grid); never browser_click. ` +
-        `Incorporate this guidance now:]\n${userText}`
-    );
+    return `[User] ${t}`;
 }
 
 /** Drop in-flight browser work when the user cancels mid-task. */
@@ -1355,6 +1372,226 @@ async function handleSpatialToolWithPlanner(functionCall: any) {
     }
 }
 
+/**
+ * Agentic click loop: flash-lite finds the target, clicks, verifies, retries.
+ * No max-attempt cap — loops until flash-lite says "done" or system error.
+ */
+async function handleClickTarget(functionCall: any) {
+    const id = String(functionCall.id);
+    const args = (functionCall.args ?? {}) as Record<string, unknown>;
+    const goal = String(args.goal || '').trim();
+    const clickCount = Number(args.clickCount) === 2 ? 2 : 1;
+    const started = Date.now();
+    const attempts: ClickAttempt[] = [];
+
+    if (!goal) {
+        sendToolResult(id, 'click_target', { ok: false, error: 'missing_goal' }, 'when_idle');
+        onToolPipelineMaybeIdle('click-target-no-goal');
+        return;
+    }
+
+    if (!clickAgent.isAvailable()) {
+        // Fallback: tell Live to use view_click manually
+        sendToolResult(id, 'click_target', {
+            ok: false,
+            error: 'click_agent_unavailable',
+            goal,
+        }, 'when_idle');
+        onToolPipelineMaybeIdle('click-target-unavailable');
+        return;
+    }
+
+    console.log(`[CLICK_TARGET] Starting agentic loop goal="${goal.slice(0, 120)}"`);
+    toolsBusy = true;
+
+    try {
+        // Helper: wait for fresh FPV frame (up to 3s)
+        const waitForFreshFrame = async (afterTs: number): Promise<string | null> => {
+            const deadline = Date.now() + 3000;
+            while (Date.now() < deadline) {
+                if (lastVisionMeta.ts > afterTs && lastVisionJpeg) {
+                    return lastVisionJpeg;
+                }
+                await new Promise((r) => setTimeout(r, 200));
+            }
+            return lastVisionJpeg; // use whatever we have
+        };
+
+        // Dispatch view_click directly to frontend WS and listen for result.
+        const executeClickDirect = (x: number, y: number): Promise<Record<string, unknown>> => {
+            return new Promise((resolve) => {
+                const clickId = `ct_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+
+                if (!aiWsClient || aiWsClient.readyState !== 1) {
+                    resolve({ ok: false, error: 'visualizer_offline' });
+                    return;
+                }
+
+                const timer = setTimeout(() => {
+                    cleanup();
+                    resolve({ ok: false, error: 'click_timeout' });
+                }, 25000);
+
+                const handler = (data: any) => {
+                    try {
+                        const msg = JSON.parse(data.toString());
+                        if (msg.type === 'spatialResult' && msg.id === clickId) {
+                            cleanup();
+                            resolve(msg.result || { ok: true });
+                        }
+                    } catch { /* ignore parse errors */ }
+                };
+
+                const cleanup = () => {
+                    clearTimeout(timer);
+                    aiWsClient?.off?.('message', handler);
+                };
+
+                aiWsClient.on('message', handler);
+
+                aiWsClient.send(JSON.stringify({
+                    type: 'spatialCommand',
+                    id: clickId,
+                    name: 'view_click',
+                    args: { x, y, clickCount },
+                }));
+            });
+        };
+
+        // --- Main agentic loop ---
+        let done = false;
+        while (!done) {
+            // 1. Get current FPV
+            const preTs = lastVisionMeta.ts;
+            const frame = lastVisionJpeg;
+            if (!frame) {
+                console.warn('[CLICK_TARGET] No FPV frame available');
+                await new Promise((r) => setTimeout(r, 1000));
+                continue;
+            }
+
+            // 2. Ask flash-lite where to click
+            console.log(`[CLICK_TARGET] Asking flash-lite (attempt ${attempts.length + 1}) goal="${goal.slice(0, 80)}"`);
+            let plan;
+            try {
+                plan = await clickAgent.planClick({
+                    jpegBase64: frame,
+                    goal,
+                    attemptHistory: attempts,
+                });
+            } catch (e: any) {
+                console.error('[CLICK_TARGET] planClick error:', e?.message);
+                await new Promise((r) => setTimeout(r, 2000));
+                continue;
+            }
+
+            console.log(`[CLICK_TARGET] Plan: status=${plan.status} x=${plan.x} y=${plan.y} reason="${plan.reasoning}"`);
+
+            if (plan.status === 'done') {
+                done = true;
+                const result: ClickAgentResult = {
+                    ok: true,
+                    done: true,
+                    goal,
+                    attempts,
+                    totalMs: Date.now() - started,
+                    finalReasoning: plan.reasoning,
+                };
+                sendToolResult(id, 'click_target', result as any, 'when_idle');
+                onToolPipelineMaybeIdle('click-target-done');
+                console.log(`[CLICK_TARGET] Done in ${attempts.length} attempts, ${result.totalMs}ms: ${plan.reasoning}`);
+                return;
+            }
+
+            if (plan.status === 'need_approach') {
+                // Run inspect_browser to get closer
+                console.log('[CLICK_TARGET] Need approach — running inspect_browser');
+                const approachId = `ct_approach_${Date.now()}`;
+                dispatchSpatialPlan(approachId, 'inspect_browser', [
+                    { name: 'inspect_browser', args: { seconds: 3 } },
+                ], { planner: 'click-agent', reasoning: 'Approaching browser for click_target' });
+                // Wait for approach to complete
+                await new Promise((r) => setTimeout(r, 4000));
+                // Wait for fresh frame after approach
+                await waitForFreshFrame(preTs);
+                continue;
+            }
+
+            // status === 'click'
+            if (plan.x == null || plan.y == null) {
+                console.warn('[CLICK_TARGET] Plan returned click but no x,y');
+                continue;
+            }
+
+            // 3. Execute the click
+            const attempt: ClickAttempt = {
+                x: plan.x,
+                y: plan.y,
+                reasoning: plan.reasoning,
+            };
+
+            const clickResult = await executeClickDirect(plan.x, plan.y);
+            attempt.result = {
+                ok: clickResult.ok !== false,
+                hit: String(clickResult.hit || 'unknown'),
+                page: clickResult.page as any,
+                error: clickResult.error ? String(clickResult.error) : undefined,
+            };
+            attempts.push(attempt);
+            console.log(`[CLICK_TARGET] Click #${attempts.length} x=${plan.x} y=${plan.y} → ${attempt.result.ok ? 'ok' : attempt.result.error}`);
+
+            // 4. Wait for post-click frame
+            await new Promise((r) => setTimeout(r, 800));
+            const postFrame = await waitForFreshFrame(preTs);
+            if (!postFrame) continue;
+
+            // 5. Verify
+            let verify;
+            try {
+                verify = await clickAgent.verifyClick({
+                    jpegBase64: postFrame,
+                    goal,
+                    prevX: plan.x,
+                    prevY: plan.y,
+                    prevReason: plan.reasoning,
+                });
+            } catch (e: any) {
+                console.warn('[CLICK_TARGET] Verify error:', e?.message);
+                continue; // will retry on next loop
+            }
+
+            console.log(`[CLICK_TARGET] Verify: status=${verify.status} reason="${verify.reasoning}"`);
+
+            if (verify.status === 'done') {
+                done = true;
+                const result: ClickAgentResult = {
+                    ok: true,
+                    done: true,
+                    goal,
+                    attempts,
+                    totalMs: Date.now() - started,
+                    finalReasoning: verify.reasoning,
+                };
+                sendToolResult(id, 'click_target', result as any, 'when_idle');
+                onToolPipelineMaybeIdle('click-target-done');
+                console.log(`[CLICK_TARGET] Verified done in ${attempts.length} attempts, ${result.totalMs}ms`);
+                return;
+            }
+
+            // retry — loop continues; flash-lite will see attempt history next round
+            if (verify.x != null && verify.y != null) {
+                // Use verify's suggested new coords as a hint for next planClick
+                console.log(`[CLICK_TARGET] Verify suggests retry at x=${verify.x} y=${verify.y}`);
+            }
+        }
+    } finally {
+        if (!spatialBridge.hasPending() && !browserBridge.hasPending()) {
+            toolsBusy = false;
+            onToolPipelineMaybeIdle('click-target-end');
+        }
+    }
+}
+
 function dispatchBrowserPlan(
     toolCallId: string,
     originalName: string,
@@ -1467,32 +1704,25 @@ function claimToolCallId(id: string): boolean {
 }
 
 /**
- * Reject deprecated browser_click tools — model must use view_click (FPV grid).
- * Still ack so Live does not stall on unknown tool ids.
+ * Reject removed browser_click tools with a silent ack (no coaching text to Live).
  */
 function rewriteDeprecatedBrowserClicks(functionCalls: any[]): any[] {
     const out: any[] = [];
     for (const fc of functionCalls) {
         const n = String(fc?.name || '');
         if (n === 'browser_click' || n === 'browser_dblclick') {
-            console.warn(
-                `[BROWSER] Rejected deprecated ${n} id=${fc.id} — use view_click({x,y}) on FPV`,
-            );
+            console.warn(`[BROWSER] Dropped removed tool ${n} id=${fc.id}`);
             try {
                 session?.sendToolResponse({
                     functionResponses: [
                         silentToolResponse(fc.id, n, {
                             ok: false,
-                            error: 'deprecated_use_view_click',
-                            message:
-                                'browser_click is deprecated. Use view_click({ x: 0.42, y: 0.61 }) with FPV image coords 0–1 ((0,0)=top-left). ' +
-                                'Stand close with inspect_browser first; stay inside browserBounds minX/maxX/minY/maxY.',
-                            prefer: 'view_click',
+                            error: 'unknown_tool',
                         }),
                     ],
                 });
             } catch (e) {
-                console.warn('[BROWSER] Deprecation ack failed:', e);
+                console.warn('[BROWSER] Drop ack failed:', e);
             }
             if (fc.id) claimToolCallId(String(fc.id));
             continue;
@@ -1523,6 +1753,23 @@ function handleToolCalls(functionCalls: any[]) {
         }
 
         if (isSpatialTool(functionCall.name)) {
+            // click_target → agentic loop (separate handler)
+            if (functionCall.name === 'click_target') {
+                anyAsyncTool = true;
+                markToolsBusyFromToolCall();
+                handleClickTarget(functionCall).catch((e) => {
+                    console.error('[CLICK_TARGET] Error:', e);
+                    sendToolResult(
+                        String(functionCall.id),
+                        'click_target',
+                        { ok: false, error: String(e?.message ?? e) },
+                        'when_idle',
+                    );
+                    onToolPipelineMaybeIdle('click-target-error');
+                });
+                continue;
+            }
+
             anyAsyncTool = true;
             markToolsBusyFromToolCall();
             // Fire-and-forget async planner+dispatch (does not block other tools).

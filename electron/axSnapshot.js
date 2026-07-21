@@ -451,7 +451,7 @@ export const BUILD_AX_SNAPSHOT_JS = `(() => {
     if (closeRefs.length) axTree += 'Suggested close refs: ' + closeRefs.slice(0, 5).join(', ') + '\\n';
   }
   axTree +=
-    'Page interactive elements (use ref=eN with browser_click / browser_type):\\n' +
+    'Page interactive elements (use ref=eN with browser_type; clicks use view_click x,y):\\n' +
     (lines.length ? lines.join('\\n') : '(none visible)') +
     '\\nscroll y=' + Math.round(scroll.y) + '/' + Math.round(scroll.maxY);
 

@@ -239,6 +239,7 @@ export class SpatialController {
     else if (facingBrowser) primaryView = 'browser_far';
     else if (facingUser) primaryView = 'user';
 
+    // Factual scene graph only — no coaching / tool-policy text (stripped again on AI server).
     const grounding = {
       schema: 'trumpchan.scene.v1',
       ts: Date.now(),
@@ -251,22 +252,10 @@ export class SpatialController {
       },
       primaryView,
       entities,
-      rules: [
-        'Prefer this scene graph over inventing room objects.',
-        'Only describe page text when primaryView is browser_close or vision clearly shows the panel large.',
-        'Observed vs inferred: mark guesses as unknown; do not invent UI or props.',
-        'FPV images use x,y 0–1 ((0,0)=top-left); use view_click({x,y}) / view_look / view_go on the panel.',
-      ],
       visionCoords: {
         system: 'xy_0_1',
         origin: 'top-left',
-        x: '0=left … 1=right',
-        y: '0=top … 1=bottom',
-        tools: ['view_click', 'view_look', 'view_go'],
-        example: { x: 0.42, y: 0.61 },
       },
-      reobserve:
-        'After this result, use your newest first-person frame (x,y rulers) + this graph before the next claim or tool.',
     };
 
     return {
@@ -275,7 +264,6 @@ export class SpatialController {
       z: Number(pos.z.toFixed(2)),
       yawDeg,
       walking: this.walking,
-      // Prefer floor distance for tools / model reasoning (matches walk stop).
       distanceToBrowser: distBrowserXz != null ? Number(distBrowserXz.toFixed(2)) : null,
       distanceToBrowser3d: distBrowser3d != null ? Number(distBrowser3d.toFixed(2)) : null,
       distanceToUser: distUser != null ? Number(distUser.toFixed(2)) : null,
@@ -288,15 +276,6 @@ export class SpatialController {
       entities,
       grounding,
       physics: isPhysicsReady(),
-      hint: facingBrowser && nearBrowser
-        ? 'First-person: standing close to the floating browser — page should fill most of your view. Re-check vision before describing text.'
-        : facingBrowser
-          ? 'First-person: facing the browser but not close yet — walk closer if the page looks small.'
-          : facingUser
-            ? 'First-person: you are facing the user.'
-            : 'First-person vision: walk/turn toward browser or user to see them.',
-      instruction:
-        'Use grounding.entities as ground truth for positions. Vision confirms what is currently visible. Do not invent objects not listed unless clearly in your FPV frame.',
     };
   }
 
@@ -418,14 +397,6 @@ export class SpatialController {
       })),
       ...(lastView?.result && typeof lastView.result === 'object' ? lastView.result : {}),
       ...this.getSceneState(),
-      instruction:
-        hadViewClick
-          ? last.instruction ||
-            'Click executed via VisionPlanner (flash-lite) refined x,y. Re-check newest FPV before next click.'
-          : originalName === 'inspect_browser' ||
-              steps.some((s) => s?.name === 'inspect_browser' || s?.name === 'look_at')
-            ? 'First-person vision: describe only what you can see from your avatar eyes right now (browser only if you are facing/near it).'
-            : last.instruction,
     });
   }
 
@@ -473,7 +444,7 @@ export class SpatialController {
           this._finish(id, name, {
             ok: result?.ok !== false,
             ...(result && typeof result === 'object' ? result : {}),
-            reobserve: result?.reobserve || 'Use newest FPV frame (with grid) before next action.',
+
           });
         } catch (e) {
           this._finish(id, name, { ok: false, error: String(e?.message ?? e) });
@@ -483,7 +454,6 @@ export class SpatialController {
       this._finish(id, name, {
         ok: false,
         error: 'view_executor_missing',
-        message: 'view_* steps need executeViewTool on SpatialController.',
       });
       return;
     }
@@ -700,8 +670,6 @@ export class SpatialController {
         nearMetric: 'xz',
         distanceXz: Number(distXz.toFixed(2)),
         ...this.getSceneState(),
-        instruction:
-          'You are in first-person: describe only what is in front of your eyes on the floating browser. If the page is not visible, walk closer or turn toward it first.',
       });
       return;
     }
@@ -791,10 +759,6 @@ export class SpatialController {
       ...this.getSceneState(),
       ...extra,
     };
-    if (a.inspect || a.name === 'inspect_browser') {
-      result.instruction =
-        'You moved to inspect the browser. Describe what you actually see on the floating browser page now.';
-    }
     this._finish(a.id, a.name, result);
   }
 

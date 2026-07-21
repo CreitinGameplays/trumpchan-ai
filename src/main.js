@@ -1860,10 +1860,7 @@ function getBrowserViewBounds() {
     center: { x: +cx.toFixed(3), y: +cy.toFixed(3) },
     samplePoints,
     cells,
-    hint:
-      maxX > minX
-        ? `Browser panel is in view x∈[${minX.toFixed(2)},${maxX.toFixed(2)}] y∈[${minY.toFixed(2)},${maxY.toFixed(2)}]. Prefer view_click({x,y}) inside that box (center≈${cx.toFixed(2)},${cy.toFixed(2)}).`
-        : 'Browser panel is not clearly on-screen; call inspect_browser first.',
+    /* panel bounds for model */
   };
 }
 
@@ -1902,9 +1899,6 @@ function resolveViewRay(args = {}) {
       return {
         ok: false,
         error: 'bad_coords',
-        message:
-          'Prefer x,y in 0–1 over the FPV image ((0,0)=top-left, (1,1)=bottom-right), e.g. view_click({x:0.45,y:0.62}). ' +
-          'Legacy cell labels (H6) still work if x/y omitted.',
       };
     }
     x = parsed.x;
@@ -1926,8 +1920,6 @@ function resolveViewRay(args = {}) {
     return {
       ok: false,
       error: 'missing_coords',
-      message:
-        'Pass x and y in 0–1 over the first-person image ((0,0)=top-left, (1,1)=bottom-right). Example: view_click({x:0.42,y:0.58}).',
     };
   }
 
@@ -1999,12 +1991,7 @@ function resolveViewRay(args = {}) {
       hit: 'none',
       view: { x, y, cell },
       browserBounds,
-      message:
-        browserBounds?.hint ||
-        'Ray hit nothing useful. Look at the target or pick another cell on the panel.',
-      instruction: browserBounds?.cells?.length
-        ? `Use a cell ON the browser: e.g. ${browserBounds.cells[Math.floor(browserBounds.cells.length / 2)]}. Column A is often empty space.`
-        : 'Call inspect_browser so the panel fills the view, then view_click a center cell (E4/F4).',
+      error: 'miss',
     };
   }
 
@@ -2120,9 +2107,7 @@ async function handleViewClick(args = {}) {
     return {
       ...resolved,
       action: 'none',
-      instruction:
-        resolved.instruction ||
-        'Nothing hit. Use a cell listed in browserBounds.cells (center of panel), not empty left/right columns.',
+      error: resolved.error || 'miss',
     };
   }
 
@@ -2166,10 +2151,6 @@ async function handleViewClick(args = {}) {
           method: result?.method,
           error: result?.error,
         },
-        reobserve: 'Next vision frame should show the cursor and any page change.',
-        instruction: resolved.snapped
-          ? `Snapped off-panel cell onto the browser and clicked page (${px.toFixed(2)},${py.toFixed(2)}). Prefer cells: ${resolved.browserBounds?.cells?.slice(0, 8)?.join(', ') || 'E4/F4'}.`
-          : 'Clicked the page. Re-check vision. Prefer ref= from snapshot when available.',
       };
     } catch (e) {
       console.warn('[ViewClick] browser click failed:', e?.message ?? e);
@@ -2198,7 +2179,7 @@ async function handleViewClick(args = {}) {
         ok: true,
         action: 'toolbar_address',
         ...resolved,
-        message: 'Hit address bar. Use browser_navigate with url/query, not view_click.',
+        error: 'address_bar',
       };
     } catch (e) {
       return { ok: false, error: String(e?.message ?? e), ...resolved };
@@ -2210,7 +2191,7 @@ async function handleViewClick(args = {}) {
       ok: true,
       action: 'browser_frame',
       ...resolved,
-      message: 'Hit the panel frame, not the page. Aim a cell on the bright content area.',
+      error: 'browser_frame',
     };
   }
 
@@ -2253,15 +2234,14 @@ async function handleViewClick(args = {}) {
       action: 'walk_floor',
       ...resolved,
       ...spatialController?.getSceneState?.(),
-      instruction: 'Moved toward that floor point. Re-check vision.',
     };
   }
 
   return {
     ok: true,
     action: 'look_only',
+    hit: resolved.hit,
     ...resolved,
-    message: `Hit ${resolved.hit}. No click action for this surface; use view_look or named tools.`,
   };
 }
 
@@ -2269,7 +2249,7 @@ async function handleViewLook(args = {}) {
   const resolved = resolveViewRay(args);
   if (!resolved.ok) return resolved;
   if (resolved.hit === 'none' || !resolved.world) {
-    return { ...resolved, action: 'look_miss', message: 'Nothing to look at there.' };
+    return { ...resolved, action: 'look_miss', error: 'miss' };
   }
   ensureSpatialController();
   const sc = spatialController;
@@ -2288,7 +2268,6 @@ async function handleViewLook(args = {}) {
     action: 'look',
     ...resolved,
     ...spatialController?.getSceneState?.(),
-    instruction: 'Looking at that point. Re-check vision.',
   };
 }
 
@@ -2314,7 +2293,6 @@ async function handleViewGo(args = {}) {
             action: 'approach_browser',
             ...resolved,
             ...sc.getSceneState(),
-            instruction: 'Approached the browser. Use view_click on a content cell to interact.',
           });
           return;
         }
@@ -2353,7 +2331,6 @@ async function handleViewSpatialCommand(cmd) {
         result: {
           ok: result?.ok !== false,
           ...result,
-          reobserve: result?.reobserve || 'Use newest FPV frame (with grid) before next action.',
         },
       }),
     );

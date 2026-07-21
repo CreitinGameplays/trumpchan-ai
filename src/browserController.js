@@ -102,7 +102,7 @@ export class BrowserController {
           const w = caps.contentWidth || 1024;
           const h = caps.contentHeight || 720;
           bw.setCursorNormalized(result.px.x / Math.max(w - 1, 1), result.px.y / Math.max(h - 1, 1), {
-            phase,
+            phase
           });
         }
       }
@@ -132,8 +132,8 @@ export class BrowserController {
           error: 'queue_full',
           message:
             'Browser queue full. Stop issuing parallel browser tools; wait and use one multi-step plan.',
-          queueLen: this.queue.length,
-        },
+          queueLen: this.queue.length
+        }
       });
       return;
     }
@@ -141,7 +141,7 @@ export class BrowserController {
     this.queue.push({
       id,
       name: String(cmd.name),
-      args: cmd.args && typeof cmd.args === 'object' ? cmd.args : {},
+      args: cmd.args && typeof cmd.args === 'object' ? cmd.args : {}
     });
 
     this._pumpQueue();
@@ -161,7 +161,7 @@ export class BrowserController {
           type: 'browserResult',
           id: q.id,
           name: q.name,
-          result: { ok: false, error: 'cancelled', message: reason },
+          result: { ok: false, error: 'cancelled', message: reason }
         });
       }
       // Mark current run as cancelled so _finish is skipped / reported cancelled
@@ -179,7 +179,7 @@ export class BrowserController {
           type: 'browserResult',
           id: q.id,
           name: q.name,
-          result: { ok: false, error: 'cancelled', message: reason },
+          result: { ok: false, error: 'cancelled', message: reason }
         });
         return false;
       });
@@ -249,7 +249,7 @@ export class BrowserController {
         ok: false,
         error: 'empty_plan',
         planner,
-        ...(await this._pageState()),
+        ...(await this._pageState())
       });
       return;
     }
@@ -277,9 +277,7 @@ export class BrowserController {
       reasoning,
       stepsRun: stepResults.map((s) => s.name),
       stepResults,
-      ...state,
-      instruction:
-        'Describe what you actually see on the browser page now using your vision. If the goal is incomplete, call more browser tools.',
+      ...state
     });
   }
 
@@ -346,7 +344,7 @@ export class BrowserController {
             ...(name === 'browser_toggle' ? { toggle: true } : {}),
             ...(name === 'browser_check' && args.checked === undefined && args.toggle !== true
               ? { checked: true }
-              : {}),
+              : {})
           });
         case 'browser_dismiss':
           this._playArm('click', args);
@@ -409,9 +407,7 @@ export class BrowserController {
           alreadyThere: true,
           requestedUrl: url,
           ...full,
-          elements: full.elements || [],
-          instruction:
-            'Already on this site. For CLICKS use view_click({x,y}) with FPV coords 0–1. Do not re-navigate.',
+          elements: full.elements || []
         };
       }
     } catch {
@@ -423,7 +419,7 @@ export class BrowserController {
     // Offscreen path: setUrl awaits main-process loadURL (no renderer guest V8).
     const navResult = await Promise.resolve(bw.setUrl(url)).catch((e) => ({
       ok: false,
-      error: String(e?.message ?? e),
+      error: String(e?.message ?? e)
     }));
     if (navResult && navResult.ok === false) {
       return { ok: false, action: 'navigate', requestedUrl: url, ...navResult };
@@ -451,10 +447,7 @@ export class BrowserController {
       captchaWall,
       ...state,
       elements: state.elements || [],
-      axTree: state.axTree,
-      instruction: captchaWall
-        ? 'CAPTCHA / bot wall detected (e.g. Google sorry page). Do NOT spam clicks. Tell the user, try DuckDuckGo/direct site URLs, or wait — parallel captcha grid clicks usually timeout.'
-        : 'Page navigated. For CLICKS use view_click({x,y}) 0–1 on FPV. browser_type may use ref= for fields. Prefer browser_snapshot only for structure/typing.',
+      axTree: state.axTree
     };
   }
 
@@ -465,8 +458,7 @@ export class BrowserController {
         ok: false,
         fatal: true,
         error: 'input_requires_electron',
-        message: 'Full browser clicking needs Electron (offscreen browser). Navigate still works in iframe mode.',
-        ...(await this._pageState()),
+        ...(await this._pageState())
       };
     }
 
@@ -507,7 +499,7 @@ export class BrowserController {
       force: args.force !== false,
       hover: hoverFirst,
       hoverFirst,
-      hoverMs: args.hoverMs != null ? Number(args.hoverMs) : undefined,
+      hoverMs: args.hoverMs != null ? Number(args.hoverMs) : undefined
     };
 
     console.log(
@@ -538,9 +530,7 @@ export class BrowserController {
         error: result.error || 'click_failed',
         candidates: result.candidates,
         axTree: result.axTree,
-        ...(await this._pageState({ includeElements: true })),
-        instruction:
-          'Click target not found. Call browser_snapshot and use ref=eN from axTree, or role+name, or text= label. Coords are last resort.',
+        ...(await this._pageState({ includeElements: true }))
       };
     }
 
@@ -558,7 +548,7 @@ export class BrowserController {
       y: result.y,
       px: result.px,
       axTree: result.axTree,
-      ...(await this._pageState({ includeElements: true })),
+      ...(await this._pageState({ includeElements: true }))
     };
   }
 
@@ -569,8 +559,7 @@ export class BrowserController {
         ok: false,
         fatal: true,
         error: 'input_requires_electron',
-        message: 'Cursor move requires Electron + Playwright browser.',
-        ...(await this._pageState()),
+        ...(await this._pageState())
       };
     }
 
@@ -601,7 +590,7 @@ export class BrowserController {
       y,
       steps: args.steps != null ? Number(args.steps) : 12,
       force: args.force !== false,
-      capture: args.capture !== false,
+      capture: args.capture !== false
     };
 
     console.log(
@@ -627,8 +616,7 @@ export class BrowserController {
       y: result?.y ?? y,
       px: result?.px,
       error: result?.error,
-      ...(await this._pageState()),
-      instruction: 'Cursor moved. Click with view_click({x,y}) on the FPV point over the target (not browser_click).',
+      ...(await this._pageState())
     };
   }
 
@@ -639,8 +627,7 @@ export class BrowserController {
         ok: false,
         fatal: true,
         error: 'input_requires_electron',
-        message: 'Checkbox control requires Electron + Playwright.',
-        ...(await this._pageState()),
+        ...(await this._pageState())
       };
     }
 
@@ -662,7 +649,7 @@ export class BrowserController {
       state: args.state,
       value: args.value,
       captcha: args.captcha === true || args.recaptcha === true || args.hcaptcha === true,
-      recaptcha: args.recaptcha === true,
+      recaptcha: args.recaptcha === true
     };
 
     console.log(
@@ -675,7 +662,7 @@ export class BrowserController {
     } else {
       result = await bw.sendClickSmart?.({
         ...payload,
-        force: true,
+        force: true
       });
     }
 
@@ -698,8 +685,7 @@ export class BrowserController {
       x: result?.x,
       y: result?.y,
       px: result?.px,
-      ...(await this._pageState({ includeElements: true, includeAx: true })),
-      instruction: result?.instruction,
+      ...(await this._pageState({ includeElements: true, includeAx: true }))
     };
   }
 
@@ -710,8 +696,7 @@ export class BrowserController {
         ok: false,
         fatal: true,
         error: 'input_requires_electron',
-        message: 'Hover requires Electron + Playwright browser.',
-        ...(await this._pageState()),
+        ...(await this._pageState())
       };
     }
 
@@ -730,7 +715,7 @@ export class BrowserController {
       force: args.force !== false,
       resnapshot: args.resnapshot !== false,
       clickToOpen: args.clickToOpen === true || args.open === true,
-      open: args.clickToOpen === true || args.open === true,
+      open: args.clickToOpen === true || args.open === true
     };
 
     console.log(
@@ -760,10 +745,7 @@ export class BrowserController {
       axTree: result?.axTree,
       elements: result?.elements,
       error: result?.error,
-      ...(await this._pageState({ includeElements: true, includeAx: true })),
-      instruction:
-        result?.instruction ||
-        'Hovered. If a menu appeared, click the item with view_click({x,y}) on that FPV point. Do not use browser_click.',
+      ...(await this._pageState({ includeElements: true, includeAx: true }))
     };
   }
 
@@ -820,7 +802,7 @@ export class BrowserController {
         selector: args.selector,
         text: args.text || args.container || args.pane,
         container: args.container || args.pane,
-        target: args.target,
+        target: args.target
       });
     } else {
       const px = await bw.normalizedToContentPx(nx, ny);
@@ -842,12 +824,7 @@ export class BrowserController {
       panes: result?.panes,
       scrollers: result?.scrollers,
       requested: { dy: deltaY, dx: deltaX, pages, mode, direction, x: nx, y: ny },
-      ...(await this._pageState()),
-      instruction:
-        result?.instruction ||
-        (result?.method === 'js-no-move'
-          ? 'Scroll reported no movement — aim x,y at the specific pane (sidebar/chat/main), or try pages=1 / mode=bottom.'
-          : undefined),
+      ...(await this._pageState())
     };
   }
 
@@ -890,7 +867,7 @@ export class BrowserController {
       selector: args.selector,
       label: args.label || args.field || args.placeholder,
       field: args.field,
-      placeholder: args.placeholder,
+      placeholder: args.placeholder
     };
 
     console.log(
@@ -931,10 +908,7 @@ export class BrowserController {
       pressEnter: !!result?.pressEnter || pressEnter,
       enter: result?.enter,
       error: result?.error,
-      ...(await this._pageState()),
-      instruction: pressEnter
-        ? 'Typed and pressed Enter/send. Describe what happened (message sent, search results, etc.).'
-        : undefined,
+      ...(await this._pageState())
     };
   }
 
@@ -956,7 +930,7 @@ export class BrowserController {
       elementId: args.elementId != null ? Number(args.elementId) : undefined,
       selector: args.selector,
       text: args.label || args.field,
-      label: args.label || args.field,
+      label: args.label || args.field
     };
 
     console.log(`[BrowserCtrl] Key smart ${key} repeat=${payload.repeat || 1}`);
@@ -981,7 +955,7 @@ export class BrowserController {
       repeat: result?.repeat,
       clear: result?.clear,
       error: result?.error,
-      ...(await this._pageState()),
+      ...(await this._pageState())
     };
   }
 
@@ -1004,7 +978,7 @@ export class BrowserController {
       y2: args.y2 != null ? clamp01(args.y2) : undefined,
       elementId: args.elementId != null ? Number(args.elementId) : undefined,
       selector: args.selector,
-      label: args.label || args.field,
+      label: args.label || args.field
     };
 
     console.log(
@@ -1037,7 +1011,7 @@ export class BrowserController {
       selection: result?.selection ? String(result.selection).slice(0, 2000) : '',
       copied: result?.copied,
       error: result?.error,
-      ...(await this._pageState()),
+      ...(await this._pageState())
     };
   }
 
@@ -1050,7 +1024,7 @@ export class BrowserController {
     let result = null;
     if (typeof bw.dismissSmart === 'function') {
       result = await bw.dismissSmart({
-        aggressive: args.aggressive !== false,
+        aggressive: args.aggressive !== false
       });
     } else {
       await bw.sendKey?.('Escape');
@@ -1067,12 +1041,7 @@ export class BrowserController {
       closeRefs: result?.closeRefs || state.closeRefs,
       axTree: result?.axTree || state.axTree,
       error: result?.error,
-      ...state,
-      instruction:
-        result?.instruction ||
-        (result?.modalBlocking
-          ? 'Popup may remain. Click a [CLOSE] ref from axTree or call browser_dismiss again.'
-          : 'Overlay cleared if present. Use fresh refs from axTree.'),
+      ...state
     };
   }
 
@@ -1086,7 +1055,7 @@ export class BrowserController {
         action: 'read',
         what,
         text: selection ? String(selection).slice(0, 4000) : '',
-        ...(await this._pageState()),
+        ...(await this._pageState())
       };
     }
     if (what === 'url' || what === 'title') {
@@ -1098,8 +1067,7 @@ export class BrowserController {
         ok: true,
         action: 'read',
         what,
-        ...(await this._pageState({ includeElements: true, includeAx: true })),
-        instruction: 'Use view_click (FPV grid) for clicks; ref= only for browser_type focus.',
+        ...(await this._pageState({ includeElements: true, includeAx: true }))
       };
     }
     // visible text sample (truncated)
@@ -1109,7 +1077,7 @@ export class BrowserController {
       action: 'read',
       what: 'visible_text',
       text: text ? String(text).slice(0, 4000) : '',
-      ...(await this._pageState()),
+      ...(await this._pageState())
     };
   }
 
@@ -1126,7 +1094,7 @@ export class BrowserController {
             axTree: snap.axTree || state.axTree,
             scroll: snap.scroll || state.scroll,
             textSample: snap.textSample,
-            elementCount: snap.count ?? state.elementCount,
+            elementCount: snap.count ?? state.elementCount
           };
         }
       } catch (e) {
@@ -1142,10 +1110,7 @@ export class BrowserController {
       action: 'snapshot',
       ...state,
       hasCrop: Boolean(crop?.data),
-      cropMeta: crop ? { width: crop.width, height: crop.height, mimeType: crop.mimeType } : null,
-      instruction: state.modalBlocking
-        ? '⚠ Modal/popup blocking the page. Call browser_dismiss first (or click a [CLOSE] ref), then re-snapshot.'
-        : 'Clicks: view_click({x:0.5,y:0.5}). Type: browser_type({ref:"e1", text:"…"}). Dismiss popups: browser_dismiss.',
+      cropMeta: crop ? { width: crop.width, height: crop.height, mimeType: crop.mimeType } : null
     };
   }
 
@@ -1170,7 +1135,7 @@ export class BrowserController {
           data: crop.data,
           width: crop.width,
           height: crop.height,
-          ts: Date.now(),
+          ts: Date.now()
         });
       }
       return crop;
@@ -1188,7 +1153,7 @@ export class BrowserController {
     try {
       const st = await bw.getPageState({
         includeElements: includeElements || includeAx,
-        includeAx: includeAx || includeElements,
+        includeAx: includeAx || includeElements
       });
       return st;
     } catch (e) {
@@ -1222,9 +1187,19 @@ export class BrowserController {
           .filter(Boolean)
       : undefined;
 
+    // Factual browser state only — strip coaching before send (AI server also strips).
+    const stripKeys = ['instruction', 'reobserve', 'prefer', 'hint', 'message'];
+    const factResult = { ...(result && typeof result === 'object' ? result : {}) };
+    for (const k of stripKeys) delete factResult[k];
+    if (factResult.grounding && typeof factResult.grounding === 'object') {
+      const g = { ...factResult.grounding };
+      for (const k of stripKeys) delete g[k];
+      delete g.rules;
+      factResult.grounding = g;
+    }
     const payload = {
       ok: result?.ok !== false,
-      ...result,
+      ...factResult,
       ...(captchaWall ? { captchaWall: true } : {}),
       grounding: {
         schema: 'trumpchan.browser.v1',
@@ -1233,28 +1208,14 @@ export class BrowserController {
         title: result?.title ?? null,
         captchaWall: Boolean(captchaWall),
         elementCount: elementCount ?? null,
-        sampleRefs: refs || null,
-        prefer: 'Clicks: view_click({x,y}) 0–1 on FPV only. Type: browser_type with ref=. browser_click is deprecated.',
-        rules: [
-          'Do not invent buttons or page text not in vision or this result.',
-          'If captchaWall, stop; use view_click on tiles or another site.',
-          'After this result, re-check your newest first-person frame before the next claim.',
-          'Never call browser_click — use view_click.',
-        ],
-      },
-      reobserve:
-        'Closed loop: wait for your next vision frame + this result before describing the page or view_click again.',
-      instruction:
-        result?.instruction ||
-        (captchaWall
-          ? 'CAPTCHA/bot wall. Tell the user; do not invent puzzle tiles. Prefer another site or wait.'
-          : 'Describe only what you see now. Next click: view_click({x,y}) on the panel.'),
+        sampleRefs: refs || null
+      }
     };
     this.opts.sendResult?.({
       type: 'browserResult',
       id,
       name,
-      result: payload,
+      result: payload
     });
     if (String(id).includes('__step')) return;
     this.busy = false;
