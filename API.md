@@ -497,3 +497,81 @@ The server auto-reconnects with exponential backoff when the Live connection dro
 - **Backoff** only resets after a session has stayed open longer than 15s, so a connect-then-immediately-die loop keeps backing off instead of hammering the API.
 - **Close code `1007`** (`Request contains an invalid argument`) on `gemini-3.1-flash-live-preview` is a known stale-resumption-handle/context problem. Retrying with the same handle reproduces it forever, so the server **drops the resumption handle and reconnects fresh** on 1007. These closes are excluded from the vision circuit breaker.
 - **Vision circuit breaker**: if non-1007 closes burst rapidly (4 within 60s) while video is streaming, the server disables vision frame forwarding to keep audio/text alive, then requires a restart to re-enable vision.
+
+---
+
+## Alternative AI backend (OpenAI-compatible multimodal)
+
+The Gemini Live backend (`backend/ai-server.ts`) is **unchanged**. An alternative backend (`backend/ai-server-openai.ts`) uses the **OpenAI Node SDK** against **any OpenAI-compatible** Chat Completions API (text + tools + `image_url` vision) and **does not** use the Gemini Live API.
+
+**Defaults** (change freely in `.env`):
+
+| Setting | Env | Default |
+|---------|-----|---------|
+| Provider base URL | `OPENAI_BASE_URL` or `CUSTOM_OPENAI_BASE_URL` | `https://ai.dext.top/v1` |
+| Model id | `OPENAI_MODEL` or `CUSTOM_OPENAI_MODEL` | `step-3.7-flash` |
+| API key | `CUSTOM_OPENAI_KEY` or `OPENAI_API_KEY` | (required) |
+
+Any OpenAI-compatible host works (`https://api.openai.com/v1`, OpenRouter, local vLLM, aihub, dext, etc.) as long as the **model supports multimodal image input + tool calling** (or vision degrades: tools still work; FPV is ignored by non-vision models).
+
+### Why a second backend
+
+Models like `step-3.7-flash` (and most OpenAI omni models) are multimodal with tool calling, but they have **no live WebSocket** like Gemini Live. The OpenAI backend **replicates** live behavior with:
+
+| Gemini Live | OpenAI alternative |
+|-------------|--------------------|
+| Continuous FPV video stream | Cache newest FPV JPEG; attach as `image_url` base64 on **each user turn** + tool rounds |
+| Native streaming audio | Stream **text** → **Fish Audio TTS** (`s2.1-pro-free`, PCM 24 kHz) → frontend `audio` |
+| Native tool calls over Live | OpenAI `tools` + multi-round agent loop (same emotion/spatial/browser tools) |
+| Mid-turn steers | Queue steers while a turn is active; flush after the turn completes |
+
+Same hub protocol: WS on port `3000` (`chatMessage`, `visionFrame`, `spatialCommand` / `spatialResult`, `browserCommand` / `browserResult`, `audio`, `caption`, `emotion`).
+
+### Switch backends
+
+| Command | Backend |
+|---------|---------|
+| `npm run dev` / `npm run dev:electron` | Gemini Live (`backend/ai-server.ts`) |
+| `npm run dev:openai` / `npm run dev:electron:openai` | OpenAI + Fish (`backend/ai-server-openai.ts`) |
+| `npm run dev:ai:openai` | OpenAI AI process only (hub must be on `:3000`) |
+
+### Env (OpenAI backend)
+
+| Variable | Role |
+|----------|------|
+| `CUSTOM_OPENAI_KEY` or `OPENAI_API_KEY` | **Required.** API key for your chosen provider |
+| `OPENAI_BASE_URL` or `CUSTOM_OPENAI_BASE_URL` | OpenAI-compatible base URL ending in `/v1`. Default `https://ai.dext.top/v1`. Swap to e.g. `https://api.openai.com/v1` for official OpenAI |
+| `OPENAI_MODEL` or `CUSTOM_OPENAI_MODEL` | Model id string as the provider expects it. Default `step-3.7-flash`. Examples: `gpt-4o`, `gpt-4.1`, other omni/multimodal IDs on the same base URL |
+| `OPENAI_REASONING_EFFORT` | Optional. `low` / `medium` / `high` for reasoning models (default `low`). Set `off` / empty to omit (better for plain chat models) |
+| `FISHAUDIO_KEY` | Fish Audio TTS key |
+| `FISH_TTS_MODEL` | Default `s2.1-pro-free` |
+| `FISH_TTS_REFERENCE_ID` | Optional voice clone id |
+| `FISH_TTS_LATENCY` | `balanced` (default) / `normal` / `low` |
+| `TTS_ENABLED=0` | Captions only (no Fish TTS) |
+
+**Switching provider/model examples:**
+
+```bash
+# Official OpenAI
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-4o
+OPENAI_REASONING_EFFORT=off
+
+# Default dext / step
+CUSTOM_OPENAI_BASE_URL=https://ai.dext.top/v1
+CUSTOM_OPENAI_KEY=sk-...
+OPENAI_MODEL=step-3.7-flash
+```
+
+Gemini Live still uses `GEMINI_API_KEY` (and optional voice changer). Fish Audio is **not** used by the Live backend.
+
+### Tools
+
+OpenAI tools are converted from the same Gemini declarations in `backend/tools/spatial.ts` + `backend/tools/browser.ts` (+ `set_emotion`) via `backend/tools/openai-tools.ts` — full parity with Live (no separate “planner” path).
+
+### Files
+
+- `backend/ai-server-openai.ts` — main OpenAI backend
+- `backend/tools/openai-tools.ts` — Gemini → OpenAI tool conversion
+- `backend/fish-tts.ts` — Fish Audio TTS (PCM 24 kHz → hub)

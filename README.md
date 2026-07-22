@@ -115,8 +115,11 @@ browserWindow.reload()
 - `electron/main.js` / `browserService.js` / `axSnapshot.js` / `preload.cjs` - Electron main + Playwright Chromium guest browser
 - `src/browserController.js` - AI browser tool executor
 - `backend/server.js` - HTTP + WebSocket command server
-- `backend/ai-server.ts` - Gemini Live AI proxy
-- `backend/voice-changer.ts` - ffmpeg-based voice effect
+- `backend/ai-server.ts` - Gemini Live AI proxy (default)
+- `backend/ai-server-openai.ts` - OpenAI-compatible multimodal backend (any model/provider + Fish TTS)
+- `backend/tools/openai-tools.ts` - tool decls converted for OpenAI
+- `backend/fish-tts.ts` - Fish Audio TTS (OpenAI backend only)
+- `backend/voice-changer.ts` - ffmpeg voice effect (Gemini Live only)
 - `package.json` - scripts and dependencies
 
 ## Build for production
@@ -136,21 +139,40 @@ The production files will be created in `dist/`.
 
 ## npm scripts
 
-- `npm run dev` - Vite + backend server + AI backend (browser-tab mode)
-- `npm run dev:electron` - same as above plus Electron (offscreen in-scene browser)
-- `npm run dev:vite` - Vite dev server only
-- `npm run dev:server` - backend WebSocket/API server only
-- `npm run dev:ai` - AI backend only (waits for the server on port 3000)
-- `npm run electron` - launch Electron against the built `dist/` (run `npm run build` first)
-- `npm run build` - production build to `dist/`
-- `npm run preview` - preview the production build
+- `npm run dev` - Vite + hub + **Gemini Live** AI
+- `npm run dev:openai` - Vite + hub + **OpenAI-compatible** multimodal AI
+- `npm run dev:electron` - Gemini Live + Electron
+- `npm run dev:electron:openai` - OpenAI backend + Electron
+- `npm run dev:vite` - Vite only
+- `npm run dev:server` - hub WebSocket/API only
+- `npm run dev:ai` - Gemini Live AI only (waits for :3000)
+- `npm run dev:ai:openai` - OpenAI AI only (waits for :3000)
+- `npm run electron` - Electron against `dist/` (build first)
+- `npm run build` / `npm run preview` - production build
 
 ## `.env` template
 
 ```
+# Gemini Live backend
 GEMINI_API_KEY=api-key-here
 FFMPEG_BINARY=ffmpeg
 VOICE_CHANGER_CONFIG=./voice-changer-config.json
 VOICE_CHANGER_ENABLED=true/false
-XINJIANYA_KEY=sk-key
+
+# OpenAI-compatible multimodal backend (any provider + model)
+# Key: CUSTOM_OPENAI_KEY or OPENAI_API_KEY
+CUSTOM_OPENAI_KEY=sk-key
+# Base URL must be OpenAI Chat Completions compatible (…/v1). Swap freely.
+CUSTOM_OPENAI_BASE_URL=https://ai.dext.top/v1
+# OPENAI_BASE_URL=https://api.openai.com/v1
+# Multimodal/omni model id as the provider names it (default step-3.7-flash)
+OPENAI_MODEL=step-3.7-flash
+# OPENAI_MODEL=gpt-4o
+# Reasoning models only; set off for plain chat models
+OPENAI_REASONING_EFFORT=low
+
+# Fish Audio TTS (OpenAI backend only)
+FISHAUDIO_KEY=your-fish-key
+FISH_TTS_MODEL=s2.1-pro-free
+FISH_TTS_REFERENCE_ID=optional-voice-id
 ```

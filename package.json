@@ -9,7 +9,10 @@
     "dev:vite": "vite",
     "dev:server": "node backend/server.js",
     "dev:ai": "wait-on tcp:3000 && tsx backend/ai-server.ts",
+    "dev:ai:openai": "wait-on tcp:3000 && tsx backend/ai-server-openai.ts",
+    "dev:openai": "concurrently -n vite,server,ai \"npm run dev:vite\" \"npm run dev:server\" \"npm run dev:ai:openai\"",
     "dev:electron": "concurrently -n vite,server,ai,electron \"npm run dev:vite\" \"npm run dev:server\" \"npm run dev:ai\" \"npm run electron:wait\"",
+    "dev:electron:openai": "concurrently -n vite,server,ai,electron \"npm run dev:vite\" \"npm run dev:server\" \"npm run dev:ai:openai\" \"npm run electron:wait\"",
     "electron:wait": "wait-on tcp:5173 && electron .",
     "electron": "electron .",
     "postinstall": "npx playwright install chromium",
@@ -24,6 +27,7 @@
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "openai": "^4.104.0",
     "playwright": "^1.61.1",
     "three": "^0.181.1",
     "ws": "^8.21.0"
