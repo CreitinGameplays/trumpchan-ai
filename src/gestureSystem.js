@@ -449,17 +449,27 @@ export class GestureController {
    * Force a keypose for browser interaction (reach / click / type).
    * Preempts co-speech scheduling so the arm motion is readable on tool use.
    * @param {'reach'|'click'|'hover'|'type'|'move'|'check'} kind
-   * @param {{ side?: 'left'|'right', hold?: number }} [opts]
+   * @param {{ side?: 'left'|'right'|'auto', hold?: number, viewX?: number, viewY?: number, pageX?: number, pageY?: number }} [opts]
    */
   playBrowserInteract(kind = 'reach', opts = {}) {
     if (!this.rig) {
       console.warn('[Gesture] playBrowserInteract: no rig');
       return false;
     }
+    // Aimed click: directed one-arm reach toward click coords (auto left/right).
+    if (
+      kind === 'click' ||
+      kind === 'dblclick' ||
+      kind === 'rightclick' ||
+      opts.aim === true
+    ) {
+      return this.playClickReach(opts);
+    }
     const map = {
       reach: 'reachBrowser',
       click: 'clickBrowser',
       dblclick: 'clickBrowser',
+      rightclick: 'clickBrowser',
       hover: 'hoverBrowser',
       move: 'hoverBrowser',
       check: 'clickBrowser',
@@ -476,7 +486,7 @@ export class GestureController {
     if (pose.twoHandOnly || pose.twoHand) {
       sides = ['left', 'right'];
     } else {
-      const side = opts.side === 'left' || opts.side === 'right' ? opts.side : 'right';
+      const side = this._pickClickSide(opts);
       sides = [side];
       this.lastDominant = side;
     }
@@ -492,6 +502,7 @@ export class GestureController {
       hold: Number.isFinite(hold) && hold > 0 ? hold : kind === 'type' ? 1.1 : 0.55,
       release: 0.45,
       browser: true,
+      dofOverride: null,
     };
     this.lastPoseKey = poseKey;
     // Hold master weight for the gesture duration even when not speaking
@@ -500,6 +511,117 @@ export class GestureController {
       this.elapsed + this.gesture.attack + this.gesture.hold + this.gesture.release + 0.15;
     this.nextGestureAt = this._browserInteractUntil + 0.4;
 
+    console.log(`[Gesture] Browser interact kind=${kind} side=${sides.join('+')}`);
+    return true;
+  }
+
+  /**
+   * Auto-pick left or right arm (never both). Prefers the side of the click
+   * in FPV / page space; falls back to alternating lastDominant.
+   * @param {{ side?: string, viewX?: number, pageX?: number }} opts
+   * @returns {'left'|'right'}
+   */
+  _pickClickSide(opts = {}) {
+    if (opts.side === 'left' || opts.side === 'right') return opts.side;
+    const hx =
+      opts.pageX != null && Number.isFinite(Number(opts.pageX))
+        ? Number(opts.pageX)
+        : opts.viewX != null && Number.isFinite(Number(opts.viewX))
+          ? Number(opts.viewX)
+          : null;
+    if (hx != null) {
+      // Left half of image/page → left arm; right half → right arm.
+      // Dead zone near center: keep last dominant so rapid mid-clicks don't thrash.
+      if (hx < 0.42) return 'left';
+      if (hx > 0.58) return 'right';
+      return this.lastDominant === 'left' ? 'left' : 'right';
+    }
+    // No aim: alternate for variety
+    return this.lastDominant === 'left' ? 'right' : 'left';
+  }
+
+  /**
+   * Reach + extend one arm toward a click target (view/page coords).
+   * Side is auto-chosen from horizontal position; vertical aims arm raise / elbow.
+   * @param {{
+   *   side?: 'left'|'right'|'auto',
+   *   viewX?: number, viewY?: number,
+   *   pageX?: number, pageY?: number,
+   *   hold?: number,
+   *   button?: string,
+   * }} opts
+   */
+  playClickReach(opts = {}) {
+    if (!this.rig) {
+      console.warn('[Gesture] playClickReach: no rig');
+      return false;
+    }
+
+    const side = this._pickClickSide(opts);
+    this.lastDominant = side;
+
+    // Prefer page UV when clicking the browser panel; else full FPV.
+    const ux =
+      opts.pageX != null && Number.isFinite(Number(opts.pageX))
+        ? Math.max(0, Math.min(1, Number(opts.pageX)))
+        : opts.viewX != null && Number.isFinite(Number(opts.viewX))
+          ? Math.max(0, Math.min(1, Number(opts.viewX)))
+          : 0.5;
+    const uy =
+      opts.pageY != null && Number.isFinite(Number(opts.pageY))
+        ? Math.max(0, Math.min(1, Number(opts.pageY)))
+        : opts.viewY != null && Number.isFinite(Number(opts.viewY))
+          ? Math.max(0, Math.min(1, Number(opts.viewY)))
+          : 0.5;
+
+    // Vertical: top of image (y~0) → higher raise / straighter arm; bottom → lower raise / more elbow.
+    const elev = 1 - uy; // 1 = top, 0 = bottom
+    // Lateral: how far from center toward the chosen side's outer edge (0 center → 1 outer).
+    const lateral =
+      side === 'left' ? Math.max(0, Math.min(1, (0.5 - ux) * 2)) : Math.max(0, Math.min(1, (ux - 0.5) * 2));
+
+    // Base click pose + aim offsets (radians)
+    const armRaise = 0.42 + elev * 0.38; // ~0.42 bottom → ~0.80 top
+    const armOut = 0.12 + lateral * 0.55; // more out for side clicks
+    const armTwist = 0.08 + elev * 0.08;
+    // More extended (less elbow bend) when aiming high / further; more bent when low.
+    const elbowBend = 0.95 - elev * 0.35 - lateral * 0.08; // ~0.95 → ~0.55
+    const wristPitch = -0.15 - elev * 0.25;
+    const wristYaw = (side === 'left' ? -1 : 1) * (0.05 + lateral * 0.12);
+
+    const dofOverride = {
+      armRaise,
+      armOut,
+      armTwist,
+      elbowBend: Math.max(0.4, Math.min(1.35, elbowBend)),
+      wristPitch,
+      wristYaw,
+    };
+
+    const hold = Number(opts.hold);
+    this.gesture = {
+      poseKey: 'clickBrowser',
+      sides: [side],
+      phase: 'attack',
+      t: 0,
+      weight: 0,
+      attack: 0.22,
+      hold: Number.isFinite(hold) && hold > 0 ? hold : 0.48,
+      release: 0.4,
+      browser: true,
+      dofOverride,
+      fingers: 'point',
+    };
+    this.lastPoseKey = 'clickBrowser';
+    this.weight = Math.max(this.weight, 0.98);
+    this._browserInteractUntil =
+      this.elapsed + this.gesture.attack + this.gesture.hold + this.gesture.release + 0.12;
+    this.nextGestureAt = this._browserInteractUntil + 0.35;
+
+    console.log(
+      `[Gesture] Click reach side=${side} aim=(${ux.toFixed(2)},${uy.toFixed(2)}) ` +
+        `raise=${armRaise.toFixed(2)} out=${armOut.toFixed(2)} elbow=${dofOverride.elbowBend.toFixed(2)}`,
+    );
     return true;
   }
 
@@ -747,9 +869,11 @@ export class GestureController {
       };
 
       // Pose DOFs (the big readable gesture), scaled by envelope + master weight.
+      // Browser click reach may supply dofOverride (aimed toward click coords).
       if (inGesture && pose) {
         const w = gw * this.weight;
-        for (const [dofName, value] of Object.entries(pose.dof)) {
+        const dof = g?.dofOverride && typeof g.dofOverride === 'object' ? g.dofOverride : pose.dof;
+        for (const [dofName, value] of Object.entries(dof)) {
           const map = DOF_AXIS[dofName];
           if (!map) continue;
           acc[map.bone][map.axis] += value * w * map.sign[side];
@@ -791,8 +915,14 @@ export class GestureController {
         this._pushOut[side] = Math.max(0, this._pushOut[side] - PUSH_OUT_RELAX * delta);
       }
 
-      // Fingers follow the pose's hand shape.
-      const shape = inGesture && pose ? FINGER_SHAPES[pose.fingers] : null;
+      // Fingers follow the pose's hand shape (or click-reach override).
+      const fingerKey =
+        inGesture && g?.fingers
+          ? g.fingers
+          : inGesture && pose
+            ? pose.fingers
+            : null;
+      const shape = fingerKey ? FINGER_SHAPES[fingerKey] : null;
       this._applyFingers(side, shape, gw * this.weight);
     }
 

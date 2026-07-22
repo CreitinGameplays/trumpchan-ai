@@ -2111,6 +2111,50 @@ function normalizeMouseButton(raw) {
   return 'left';
 }
 
+/**
+ * Point one arm toward the click target (auto left/right, never both).
+ * Call on every successful view_click hit that has aim coords.
+ */
+function playArmTowardClick(resolved, args = {}) {
+  try {
+    const g = gestureController;
+    if (!g || typeof g.playClickReach !== 'function') {
+      // Fallback: older API
+      if (g && typeof g.playBrowserInteract === 'function') {
+        g.playBrowserInteract('click', {
+          viewX: resolved?.view?.x,
+          viewY: resolved?.view?.y,
+          pageX: resolved?.page?.x,
+          pageY: resolved?.page?.y,
+        });
+      }
+      return;
+    }
+    const kind =
+      normalizeMouseButton(args.button) === 'right'
+        ? 'rightclick'
+        : Number(args.clickCount) === 2
+          ? 'dblclick'
+          : 'click';
+    g.playClickReach({
+      viewX: resolved?.view?.x,
+      viewY: resolved?.view?.y,
+      pageX: resolved?.page?.x,
+      pageY: resolved?.page?.y,
+      button: args.button,
+      hold: kind === 'dblclick' ? 0.55 : 0.45,
+    });
+    console.log(
+      `[ViewClick] Arm reach view=(${resolved?.view?.x?.toFixed?.(2) ?? '?'},` +
+        `${resolved?.view?.y?.toFixed?.(2) ?? '?'}) page=${
+          resolved?.page ? `${resolved.page.x},${resolved.page.y}` : '-'
+        }`,
+    );
+  } catch (e) {
+    console.warn('[ViewClick] Arm reach failed:', e?.message ?? e);
+  }
+}
+
 async function handleViewClick(args = {}) {
   const resolved = resolveViewRay(args);
   if (!resolved.ok) return resolved;
@@ -2127,6 +2171,9 @@ async function handleViewClick(args = {}) {
   // Double-click only makes sense for left; force single for right/middle.
   const clickCount =
     button === 'left' && Number(args.clickCount) === 2 ? 2 : 1;
+
+  // Always animate arm toward click direction (before the actual mouse event).
+  playArmTowardClick(resolved, args);
 
   // Browser page content → Playwright click (left / right / middle)
   if (resolved.hit === 'browser' && resolved.page) {

@@ -83,8 +83,20 @@ export class BrowserController {
     try {
       const g = this.opts.getGesture?.();
       if (!g || typeof g.playBrowserInteract !== 'function') return;
-      g.playBrowserInteract(kind, { side: args.side === 'left' ? 'left' : 'right' });
-
+      // Prefer auto side from x coords when present; never force both arms.
+      const side =
+        args.side === 'left' || args.side === 'right'
+          ? args.side
+          : args.x != null || args.pageX != null
+            ? 'auto'
+            : undefined;
+      g.playBrowserInteract(kind, {
+        side,
+        pageX: args.x != null ? Number(args.x) : args.pageX != null ? Number(args.pageX) : undefined,
+        pageY: args.y != null ? Number(args.y) : args.pageY != null ? Number(args.pageY) : undefined,
+        viewX: args.viewX != null ? Number(args.viewX) : undefined,
+        viewY: args.viewY != null ? Number(args.viewY) : undefined,
+      });
     } catch (e) {
       console.warn('[BrowserCtrl] Arm pose failed:', e?.message ?? e);
     }

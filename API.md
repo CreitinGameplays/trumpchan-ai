@@ -430,6 +430,8 @@ Implementation: overlay in `drawVisionGroundingGrid` (`src/main.js`); raycast in
 
 **Clicks:** `view_click` executes Live x,y directly with optional mouse button. Gemini Live vision handles all spatial reasoning and click targeting natively.
 
+**Arm reach (visual):** On every `view_click`, the avatar extends **one** arm (auto left/right from click X — left half → left arm, right half → right arm; never both at once) toward the click direction. Height of the reach follows click Y (higher on screen → higher raise). Implemented in `GestureController.playClickReach` (`src/gestureSystem.js`), triggered from `handleViewClick` (`src/main.js`).
+
 **`browser_click` / `browser_dblclick` are deprecated** and removed from Live tool declarations. If the model still emits them, the AI server rejects with `deprecated_use_view_click`. Typing still uses `browser_type` + `ref=`.
 
 ---

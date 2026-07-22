@@ -809,7 +809,7 @@ function buildLiveConfig(): any {
         // Gemini 3.x Live uses thinkingLevel (not thinkingBudget).
         // This keeps latency low while still allowing tool use smartly.
         thinkingConfig: {
-            thinkingLevel: ThinkingLevel.HIGH, // reasoning enabled makes the model rarely hallucinate tool calls
+            thinkingLevel: ThinkingLevel.LOW, // reasoning enabled makes the model rarely hallucinate tool calls
         },
         // HIGH so the model can read more detail from the 3D scene / in-scene
         // browser (text, UI). Costs more tokens per frame than MEDIUM.
