@@ -99,6 +99,16 @@ const REASONING_EFFORT =
         : REASONING_EFFORT_RAW;
 const MAX_HISTORY_TURNS = Number(process.env.OPENAI_MAX_HISTORY_TURNS) || 12;
 
+// Global safe context-window cap. Estimated (no tokenizer dep): ~4 chars/token
+// for text + a flat image cost. We keep the *sent* prompt (system + convo +
+// tool schemas + current vision) under this so we never exceed the model window.
+const MAX_CONTEXT_TOKENS = Number(process.env.OPENAI_MAX_CONTEXT_TOKENS) || 256_000;
+// Leave room for the model's reply + tool-call plans so the request never 400s.
+const CONTEXT_OUTPUT_RESERVE = Number(process.env.OPENAI_CONTEXT_OUTPUT_RESERVE) || 8_000;
+// Rough per-image token cost for a high-detail FPV frame (OpenAI-style tiling).
+const IMAGE_TOKEN_COST = Number(process.env.OPENAI_IMAGE_TOKEN_COST) || 1_100;
+const PROMPT_TOKEN_BUDGET = Math.max(4_000, MAX_CONTEXT_TOKENS - CONTEXT_OUTPUT_RESERVE);
+
 // TTS config (Fish Audio — no voice changer; PCM24k goes straight to frontend).
 const TTS_ENABLED = process.env.TTS_ENABLED !== '0' && process.env.FISH_TTS_ENABLED !== '0';
 const FISH_KEY = process.env.FISHAUDIO_KEY || process.env.FISH_API_KEY || '';
@@ -209,11 +219,148 @@ async function appendHistoryFile(entry: any) {
     }
 }
 
-/** Trim convo to the last N turns (keep pairs roughly), preserving tool chains. */
+// ---------------------------------------------------------------------------
+// Context-window budgeting (global 256k safe cap).
+// No tokenizer dependency: estimate ~4 chars/token for text and a flat cost
+// per attached image. We enforce the budget on the ACTUAL sent prompt
+// (system + tool schemas + convo) so requests never exceed the model window.
+// ---------------------------------------------------------------------------
+
+/** Estimate tokens for any string (~4 chars/token, min 1 for non-empty). */
+function estimateTextTokens(s: string): number {
+    if (!s) return 0;
+    return Math.max(1, Math.ceil(s.length / 4));
+}
+
+/** Estimate tokens for a single chat message (text parts + images + overhead). */
+function estimateMessageTokens(m: any): number {
+    let tokens = 4; // per-message role/format overhead
+    const content = m?.content;
+    if (typeof content === 'string') {
+        tokens += estimateTextTokens(content);
+    } else if (Array.isArray(content)) {
+        for (const part of content) {
+            if (part?.type === 'text') tokens += estimateTextTokens(String(part.text || ''));
+            else if (part?.type === 'image_url') tokens += IMAGE_TOKEN_COST;
+        }
+    }
+    // Tool calls (assistant) — name + serialized args.
+    if (Array.isArray(m?.tool_calls)) {
+        for (const tc of m.tool_calls) {
+            tokens += estimateTextTokens(String(tc?.function?.name || ''));
+            tokens += estimateTextTokens(String(tc?.function?.arguments || ''));
+            tokens += 4;
+        }
+    }
+    // tool result messages carry an id + content already counted above.
+    if (m?.tool_call_id) tokens += 4;
+    return tokens;
+}
+
+/** Tools JSON-schema cost is fixed per request; compute once. */
+let _toolsTokenCost = -1;
+function toolsTokenCost(): number {
+    if (_toolsTokenCost < 0) {
+        try {
+            _toolsTokenCost = estimateTextTokens(JSON.stringify(openaiTools));
+        } catch {
+            _toolsTokenCost = 2_000;
+        }
+    }
+    return _toolsTokenCost;
+}
+
+/** Total estimated prompt tokens for a full messages array (incl. tools). */
+function estimatePromptTokens(messages: any[]): number {
+    let total = toolsTokenCost();
+    for (const m of messages) total += estimateMessageTokens(m);
+    return total;
+}
+
+/**
+ * Enforce the global context cap. Always keeps the system message + the most
+ * recent turn, and never leaves a dangling `role:tool` whose parent
+ * `assistant.tool_calls` was dropped (that would 400 the API).
+ *
+ * `systemTokens` accounts for the system prompt that buildMessages() prepends.
+ */
 function trimConvo() {
-    // Count user turns; drop oldest complete turns beyond the window.
-    const maxMsgs = MAX_HISTORY_TURNS * 4; // rough: user+assistant+tool calls
-    while (convo.length > maxMsgs) convo.shift();
+    // 1) Coarse cap by message count first (cheap, bounds worst case).
+    const hardMaxMsgs = Math.max(8, MAX_HISTORY_TURNS * 8);
+    while (convo.length > hardMaxMsgs) dropOldestTurn();
+
+    // 2) Token-budget cap against the global context window.
+    const systemTokens = estimateTextTokens(systemInstruction) + 4;
+    const budget = PROMPT_TOKEN_BUDGET;
+
+    let guard = 0;
+    while (convo.length > 1) {
+        const used = systemTokens + estimatePromptTokens(convo as any[]);
+        if (used <= budget) break;
+        dropOldestTurn();
+        if (++guard > 10_000) break; // paranoia
+    }
+
+    // Final safety: if a single latest turn still busts the budget, strip old
+    // images from all but the newest user message to reclaim big image costs.
+    let used = systemTokens + estimatePromptTokens(convo as any[]);
+    if (used > budget) {
+        stripOldImages();
+        used = systemTokens + estimatePromptTokens(convo as any[]);
+        if (used > budget) {
+            console.warn(
+                `[CTX] Prompt still ~${used} tok > budget ${budget} after trimming; ` +
+                    `sending anyway (single turn too large).`,
+            );
+        }
+    }
+}
+
+/**
+ * Remove the oldest logical turn from the front while keeping tool chains valid.
+ * A dropped assistant-with-tool_calls also drops its following tool results.
+ */
+function dropOldestTurn() {
+    if (convo.length === 0) return;
+    const first = convo[0] as any;
+
+    // Never strand tool results at the head: drop leading tool messages.
+    if (first.role === 'tool') {
+        while (convo.length && (convo[0] as any).role === 'tool') convo.shift();
+        return;
+    }
+
+    // Drop the head message.
+    convo.shift();
+
+    // If it was an assistant with tool_calls, also drop the tool results that
+    // answered it (now orphaned at the head).
+    if (first.role === 'assistant' && Array.isArray(first.tool_calls)) {
+        while (convo.length && (convo[0] as any).role === 'tool') convo.shift();
+    }
+}
+
+/** Drop image parts from every message except the most recent user message. */
+function stripOldImages() {
+    let lastUserIdx = -1;
+    for (let i = convo.length - 1; i >= 0; i--) {
+        if ((convo[i] as any).role === 'user') {
+            lastUserIdx = i;
+            break;
+        }
+    }
+    for (let i = 0; i < convo.length; i++) {
+        if (i === lastUserIdx) continue;
+        const m = convo[i] as any;
+        if (Array.isArray(m.content)) {
+            const textOnly = m.content
+                .filter((p: any) => p?.type === 'text')
+                .map((p: any) => String(p.text || ''))
+                .join(' ')
+                .trim();
+            m.content = textOnly || '(image omitted to fit context)';
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -484,9 +631,11 @@ async function runTurn(reason: string) {
             round += 1;
             trimConvo();
             const messages = buildMessages();
+            const promptTokens = estimatePromptTokens(messages as any[]);
             console.log(
                 `[TURN] Round ${round} messages=${messages.length} ` +
-                    `tools=${openaiTools.length} vision=${Boolean(lastVisionJpeg)}`,
+                    `tools=${openaiTools.length} vision=${Boolean(lastVisionJpeg)} ` +
+                    `~ctx=${promptTokens}/${PROMPT_TOKEN_BUDGET} tok (cap ${MAX_CONTEXT_TOKENS})`,
             );
 
             let stream: any;
@@ -792,6 +941,10 @@ async function startServer() {
     console.log(
         '[AI] Switch model: OPENAI_MODEL / CUSTOM_OPENAI_MODEL. ' +
             'Switch provider: OPENAI_BASE_URL / CUSTOM_OPENAI_BASE_URL (any OpenAI-compatible /v1).',
+    );
+    console.log(
+        `[CTX] Global context cap ${MAX_CONTEXT_TOKENS} tok ` +
+            `(prompt budget ${PROMPT_TOKEN_BUDGET}, reserve ${CONTEXT_OUTPUT_RESERVE}).`,
     );
     console.log(`[TTS] Fish Audio ${TTS_ENABLED ? `enabled (model=${FISH_MODEL})` : 'disabled'}.`);
 
